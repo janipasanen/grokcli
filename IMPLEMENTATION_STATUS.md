@@ -48,3 +48,6 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 - 2026-03-18: Added patch history store (`~/.local/share/grok-agent/patches.jsonl`) and implemented `--undo-last-patch`.
 - 2026-03-18: Verified undo path end-to-end against a recorded patch (reverse apply succeeded).
 - 2026-03-18: Added session resume support (`--resume-session <id|path>` and `--resume-latest`) with prior `previous_response_id` continuation for Responses mode.
+- 2026-03-18: Hardened tool outputs with truncation markers/flags across shell/search/git tools.
+- 2026-03-18: Implemented real shell timeout enforcement (`timeout_seconds`) with process kill on timeout.
+- 2026-03-18: Added unit test coverage for shell timeout path (`cargo test` passing).

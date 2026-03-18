@@ -37,10 +37,12 @@ pub fn run(repo_root: &Path, args: SearchTextArgs) -> Result<SearchTextResult> {
         .current_dir(repo_root);
     let output = cmd.output().context("failed to run rg")?;
     let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let (stdout, stdout_truncated) = truncate_output(&String::from_utf8_lossy(&output.stdout));
+    let (stderr, stderr_truncated) = truncate_output(&String::from_utf8_lossy(&output.stderr));
     let line_count = stdout.lines().count();
-    let was_truncated = line_count >= max.parse::<usize>().unwrap_or(200);
+    let was_truncated = line_count >= max.parse::<usize>().unwrap_or(200)
+        || stdout_truncated
+        || stderr_truncated;
 
     Ok(SearchTextResult {
         command: format!("rg --line-number --no-heading -m {max} '{}' {rel}", args.pattern),
@@ -49,4 +51,14 @@ pub fn run(repo_root: &Path, args: SearchTextArgs) -> Result<SearchTextResult> {
         stderr,
         was_truncated,
     })
+}
+
+fn truncate_output(text: &str) -> (String, bool) {
+    const MAX_BYTES: usize = 64 * 1024;
+    if text.len() <= MAX_BYTES {
+        return (text.to_string(), false);
+    }
+    let mut truncated = text[..MAX_BYTES].to_string();
+    truncated.push_str("\n...[output truncated]...");
+    (truncated, true)
 }
