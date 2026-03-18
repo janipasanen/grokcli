@@ -193,7 +193,7 @@ impl ToolRegistry {
           {
             "type": "function",
             "name": "apply_patch",
-            "description": "Validate and apply a raw unified diff patch compatible with git apply. The patch must use standard diff headers such as --- / +++ and @@ hunks. Do not use the Codex-style *** Begin Patch / *** Update File format. Use this when you have identified a code fix and need to modify files.",
+            "description": "Validate and apply a patch to repository files. Accepts either raw unified diff format (--- / +++ with @@ hunks) or Codex-style *** Begin Patch / *** Update File envelopes (automatically converted). Use this when you have identified a code fix and need to modify files.",
             "parameters": {
               "type": "object",
               "properties": {
