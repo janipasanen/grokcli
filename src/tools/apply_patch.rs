@@ -92,10 +92,11 @@ fn run_git_apply(repo_root: &Path, patch: &str, check_only: bool) -> Result<(boo
 }
 
 fn normalize_patch(patch: &str) -> std::result::Result<String, String> {
+    let patch = sanitize_patch_input(patch);
     if patch.lines().any(|line| line.starts_with("*** Begin Patch")) {
-        return codex_patch_to_unified_diff(patch);
+        return codex_patch_to_unified_diff(&patch);
     }
-    Ok(patch.to_string())
+    Ok(patch)
 }
 
 fn codex_patch_to_unified_diff(patch: &str) -> std::result::Result<String, String> {
@@ -134,12 +135,12 @@ fn codex_patch_to_unified_diff(patch: &str) -> std::result::Result<String, Strin
                 section.push(next.to_string());
                 let _ = lines.next();
             }
-            if section.is_empty() || !section.iter().any(|entry| entry.starts_with("@@")) {
+            if section.is_empty() {
                 return Err(format!(
-                    "invalid Codex patch format for `{path}`: missing hunk markers (`@@`)"
+                    "invalid Codex patch format for `{path}`: empty update section"
                 ));
             }
-            let section = normalize_codex_hunks(&section);
+            let section = normalize_codex_hunks_or_wrap(&section);
             let _ = writeln!(unified, "diff --git a/{path} b/{new_path}");
             let _ = writeln!(unified, "--- a/{path}");
             let _ = writeln!(unified, "+++ b/{new_path}");
@@ -199,7 +200,59 @@ fn codex_patch_to_unified_diff(patch: &str) -> std::result::Result<String, Strin
     Ok(unified)
 }
 
-fn normalize_codex_hunks(section: &[String]) -> Vec<String> {
+fn sanitize_patch_input(input: &str) -> String {
+    let mut text = input.trim().to_string();
+    if let Some(stripped) = strip_markdown_fence(&text) {
+        text = stripped;
+    }
+
+    if let Some(idx) = text.find("*** Begin Patch") {
+        if idx > 0 {
+            text = text[idx..].to_string();
+        }
+        return text;
+    }
+
+    if let Some(idx) = text.find("\ndiff --git ") {
+        text = text[idx + 1..].to_string();
+    } else if text.starts_with("diff --git ") {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        return text;
+    } else if let Some(idx) = text.find("\n--- ") {
+        text = text[idx + 1..].to_string();
+    }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text
+}
+
+fn strip_markdown_fence(input: &str) -> Option<String> {
+    if !input.starts_with("```") {
+        return None;
+    }
+    let after_open = input[3..].find('\n')?;
+    let content_start = 3 + after_open + 1;
+    let rest = &input[content_start..];
+    let close = rest.rfind("\n```")?;
+    Some(rest[..close].to_string())
+}
+
+fn normalize_codex_hunks_or_wrap(section: &[String]) -> Vec<String> {
+    if !section.iter().any(|line| line.starts_with("@@")) {
+        let (old_count, new_count) = count_hunk_lines(section);
+        let mut wrapped = Vec::with_capacity(section.len() + 1);
+        wrapped.push(format!(
+            "@@ -{} +{} @@",
+            hunk_range(1, old_count),
+            hunk_range(1, new_count)
+        ));
+        wrapped.extend(section.iter().cloned());
+        return wrapped;
+    }
+
     let mut normalized = Vec::with_capacity(section.len());
     let mut i = 0usize;
     let mut old_start = 1usize;
@@ -251,6 +304,29 @@ fn normalize_codex_hunks(section: &[String]) -> Vec<String> {
     }
 
     normalized
+}
+
+fn count_hunk_lines(lines: &[String]) -> (usize, usize) {
+    let mut old_count = 0usize;
+    let mut new_count = 0usize;
+    for line in lines {
+        if line.starts_with("\\ No newline at end of file") {
+            continue;
+        }
+        match line.chars().next() {
+            Some(' ') => {
+                old_count += 1;
+                new_count += 1;
+            }
+            Some('-') => old_count += 1,
+            Some('+') => new_count += 1,
+            Some(_) | None => {
+                old_count += 1;
+                new_count += 1;
+            }
+        }
+    }
+    (old_count, new_count)
 }
 
 fn hunk_range(start: usize, count: usize) -> String {
@@ -318,6 +394,104 @@ mod tests {
 
         assert!(!result.valid);
         assert!(result.check_stderr.contains("delete-file patches are not yet supported"));
+        Ok(())
+    }
+
+    #[test]
+    fn converts_codex_update_patch_without_explicit_hunk_markers() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("demo.txt"), "old\n")?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+*** Begin Patch
+*** Update File: demo.txt
+-old
++new
+*** End Patch
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(result.valid, "{}", result.check_stderr);
+        assert!(result.applied, "{}", result.apply_stderr);
+        assert_eq!(fs::read_to_string(dir.path().join("demo.txt"))?, "new\n");
+        Ok(())
+    }
+
+    #[test]
+    fn converts_fenced_codex_patch_and_applies() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("demo.txt"), "old\n")?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+```diff
+*** Begin Patch
+*** Update File: demo.txt
+-old
++new
+*** End Patch
+```
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(result.valid, "{}", result.check_stderr);
+        assert!(result.applied, "{}", result.apply_stderr);
+        assert_eq!(fs::read_to_string(dir.path().join("demo.txt"))?, "new\n");
+        Ok(())
+    }
+
+    #[test]
+    fn applies_fenced_unified_diff_patch() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("demo.txt"), "old\n")?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+```diff
+diff --git a/demo.txt b/demo.txt
+--- a/demo.txt
++++ b/demo.txt
+@@ -1 +1 @@
+-old
++new
+```
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(result.valid, "{}", result.check_stderr);
+        assert!(result.applied, "{}", result.apply_stderr);
+        assert_eq!(fs::read_to_string(dir.path().join("demo.txt"))?, "new\n");
         Ok(())
     }
 }
