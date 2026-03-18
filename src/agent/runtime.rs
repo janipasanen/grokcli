@@ -1,4 +1,5 @@
 use crate::config::config::AppConfig;
+use crate::persistence::patch_store::PatchStore;
 use crate::persistence::session_store::SessionStore;
 use crate::provider::models::build_simple_request;
 use crate::provider::xai_client::XaiClient;
@@ -97,6 +98,7 @@ impl AgentRuntime {
                 client,
                 &session,
                 &registry,
+                &repo_root,
                 &mut approval_cache,
                 prompt,
             )
@@ -107,6 +109,7 @@ impl AgentRuntime {
                     client,
                     &session,
                     &registry,
+                    &repo_root,
                     &mut approval_cache,
                     prompt.clone(),
                 )
@@ -122,6 +125,7 @@ impl AgentRuntime {
                             client,
                             &session,
                             &registry,
+                            &repo_root,
                             &mut approval_cache,
                             prompt,
                         )
@@ -160,6 +164,7 @@ impl AgentRuntime {
         client: &XaiClient,
         session: &SessionStore,
         registry: &ToolRegistry,
+        repo_root: &std::path::Path,
         approval_cache: &mut HashSet<String>,
         prompt: String,
     ) -> Result<()> {
@@ -232,6 +237,13 @@ impl AgentRuntime {
                       "call_id": call.call_id
                     }),
                 )?;
+                maybe_record_applied_patch(
+                    &call.name,
+                    &call.arguments,
+                    &result.result,
+                    repo_root,
+                    session.path(),
+                )?;
                 eprintln!("tool: {}", call.name);
                 outputs.push(json!({
                     "type": "function_call_output",
@@ -255,6 +267,7 @@ impl AgentRuntime {
         client: &XaiClient,
         session: &SessionStore,
         registry: &ToolRegistry,
+        repo_root: &std::path::Path,
         approval_cache: &mut HashSet<String>,
         prompt: String,
     ) -> Result<()> {
@@ -340,6 +353,13 @@ impl AgentRuntime {
                       "result": result.result,
                       "call_id": call.call_id
                     }),
+                )?;
+                maybe_record_applied_patch(
+                    &call.name,
+                    &call.arguments,
+                    &result.result,
+                    repo_root,
+                    session.path(),
                 )?;
                 eprintln!("tool: {}", call.name);
                 messages.push(json!({
@@ -609,4 +629,30 @@ fn approval_cache_key(tool_name: &str, args: &Value, reason: Option<&str>) -> Op
     }
     let reason_key = reason.unwrap_or("tier1");
     Some(format!("{}::{}", tool_name, reason_key))
+}
+
+fn maybe_record_applied_patch(
+    tool_name: &str,
+    args: &Value,
+    result: &Value,
+    repo_root: &std::path::Path,
+    session_path: &std::path::Path,
+) -> Result<()> {
+    if tool_name != "apply_patch" {
+        return Ok(());
+    }
+    let applied = result
+        .get("applied")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !applied {
+        return Ok(());
+    }
+    let patch = args.get("patch").and_then(Value::as_str).unwrap_or_default();
+    if patch.trim().is_empty() {
+        return Ok(());
+    }
+    let store = PatchStore::default()?;
+    store.append(repo_root, patch, Some(session_path))?;
+    Ok(())
 }
