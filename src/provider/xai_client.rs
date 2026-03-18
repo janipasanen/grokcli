@@ -1,17 +1,21 @@
-use crate::provider::models::{ResponsesRequest, ResponsesResponse};
+use crate::output::{OutputSink, StdOutputSink};
 use crate::provider::LanguageModelProvider;
+use crate::provider::models::{ResponsesRequest, ResponsesResponse};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
+#[derive(Clone)]
 pub struct XaiClient {
     client: reqwest::Client,
     base_url: String,
+    output: Arc<dyn OutputSink>,
 }
 
 impl XaiClient {
@@ -73,7 +77,16 @@ impl XaiClient {
         Ok(Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
+            output: Arc::new(StdOutputSink),
         })
+    }
+
+    pub fn with_output(&self, output: Arc<dyn OutputSink>) -> Self {
+        Self {
+            client: self.client.clone(),
+            base_url: self.base_url.clone(),
+            output,
+        }
     }
 
     pub async fn create_response(&self, request: &ResponsesRequest) -> Result<String> {
@@ -115,7 +128,9 @@ impl XaiClient {
                         continue;
                     }
                     let class = classify_transport(&err);
-                    return Err(anyhow!("xAI streaming request failed ({class}) at {url}: {err}"));
+                    return Err(anyhow!(
+                        "xAI streaming request failed ({class}) at {url}: {err}"
+                    ));
                 }
             };
             let status = response.status();
@@ -161,19 +176,19 @@ impl XaiClient {
                             == Some("response.output_text.delta")
                         {
                             if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                                print!("{delta}");
+                                self.output.stdout(delta);
                             }
                         }
                         if let Some(resp) = value.get("response") {
                             let resp = resp.clone();
                             if has_function_call(&resp) {
-                                println!();
+                                self.output.stdout_line("");
                                 return Ok(resp);
                             }
                             final_response = Some(resp);
                         } else if value.get("output").is_some() && value.get("id").is_some() {
                             if has_function_call(&value) {
-                                println!();
+                                self.output.stdout_line("");
                                 return Ok(value.clone());
                             }
                             final_response = Some(value.clone());
@@ -181,7 +196,7 @@ impl XaiClient {
                     }
                 }
             }
-            println!();
+            self.output.stdout_line("");
             if let Some(value) = final_response {
                 return Ok(value);
             }
@@ -230,7 +245,7 @@ impl XaiClient {
                 if let Ok(value) = serde_json::from_str::<Value>(payload) {
                     if let Some(delta) = extract_delta_text(&value) {
                         collected.push_str(&delta);
-                        print!("{delta}");
+                        self.output.stdout(&delta);
                     }
                 }
             }

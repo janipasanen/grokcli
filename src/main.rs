@@ -1,13 +1,14 @@
-use grokcli::agent::runtime::AgentRuntime;
-use grokcli::config::config::AppConfig;
-use grokcli::persistence::patch_store::PatchStore;
-use grokcli::persistence::session_store::{SessionStore, latest_session_path, resolve_session_path};
-use grokcli::provider::xai_client::XaiClient;
-use grokcli::workflows::presets::{
-    WorkflowPreset, apply_preset_prompt, infer_preset_for_prompt,
-};
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
+use grokcli::agent::runtime::{AgentRuntime, ApprovalHandler};
+use grokcli::config::config::AppConfig;
+use grokcli::output::{ExternalPrinterSink, OutputSink};
+use grokcli::persistence::patch_store::PatchStore;
+use grokcli::persistence::session_store::{
+    SessionStore, latest_session_path, resolve_session_path,
+};
+use grokcli::provider::xai_client::XaiClient;
+use grokcli::workflows::presets::{WorkflowPreset, apply_preset_prompt, infer_preset_for_prompt};
 use rustyline::error::ReadlineError;
 use rustyline::{
     Cmd, ConditionalEventHandler, DefaultEditor, Event, EventContext, EventHandler, KeyEvent,
@@ -18,7 +19,8 @@ use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum AgentMode {
@@ -38,6 +40,7 @@ enum InteractiveCommand {
     Help,
     Show,
     Exit,
+    Approve(bool),
     NewSession,
     ResumeLatest,
     Resume(String),
@@ -64,18 +67,40 @@ struct InteractiveState {
     max_steps: u32,
     preset: Option<WorkflowPreset>,
     session: SessionStore,
-    queued_tasks: VecDeque<String>,
+    queued_tasks: Arc<Mutex<VecDeque<QueuedPromptTask>>>,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedPromptTask {
+    prompt: String,
+    cfg: AppConfig,
+    mode: AgentMode,
+    max_steps: u32,
+    preset: Option<WorkflowPreset>,
+    session: SessionStore,
+}
+
+struct PendingApproval {
+    responder: mpsc::Sender<bool>,
+}
+
+#[derive(Clone)]
+struct InteractiveApprovalHandler {
+    pending: Arc<Mutex<Option<PendingApproval>>>,
+    output: Arc<dyn OutputSink>,
+}
+
+#[derive(Clone)]
+struct BackgroundTaskRunner {
+    client: XaiClient,
+    output: Arc<dyn OutputSink>,
+    approval_handler: Arc<InteractiveApprovalHandler>,
+    running: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadlineAction {
     QueueCurrentLine,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InputSource {
-    Immediate,
-    Queued,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +133,130 @@ impl ConditionalEventHandler for QueueCurrentLineHandler {
     }
 }
 
+impl ApprovalHandler for InteractiveApprovalHandler {
+    fn request_approval(&self, action: &str, reason: Option<&str>) -> Result<bool> {
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("interactive approval state poisoned"))?;
+            *pending = Some(PendingApproval { responder: tx });
+        }
+
+        match reason {
+            Some(reason) if !reason.trim().is_empty() => self.output.stderr_line(&format!(
+                "approval required for {action}: {reason} (reply with /approve yes or /approve no)"
+            )),
+            _ => self.output.stderr_line(&format!(
+                "approval required for {action} (reply with /approve yes or /approve no)"
+            )),
+        }
+
+        let approved = rx.recv().unwrap_or(false);
+        Ok(approved)
+    }
+}
+
+impl InteractiveApprovalHandler {
+    fn approve(&self, approved: bool) -> bool {
+        let pending = match self.pending.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        };
+        let Some(pending) = pending else {
+            return false;
+        };
+        let _ = pending.responder.send(approved);
+        true
+    }
+}
+
+impl BackgroundTaskRunner {
+    fn start_if_idle(&self, state: InteractiveState) {
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let runner = self.clone();
+        tokio::spawn(async move {
+            runner.run(state).await;
+        });
+    }
+
+    async fn run(self, state: InteractiveState) {
+        let mut processed = 0usize;
+        loop {
+            let task = {
+                let mut queued = match state.queued_tasks.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => break,
+                };
+                queued.pop_front()
+            };
+
+            let Some(mut task) = task else {
+                self.running.store(false, Ordering::SeqCst);
+                let should_restart = match state.queued_tasks.lock() {
+                    Ok(queued) => !queued.is_empty(),
+                    Err(_) => false,
+                };
+                if should_restart
+                    && self
+                        .running
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                {
+                    continue;
+                }
+                break;
+            };
+
+            processed += 1;
+            let remaining = queued_task_count(&state);
+            self.output.stderr_line(&format!(
+                "running queued[{}] remaining={} {}",
+                processed,
+                remaining,
+                summarize_queue_entry(&task.prompt)
+            ));
+
+            // Background queueing works best with complete-line output so the prompt can be redrawn cleanly.
+            task.cfg.stream = false;
+
+            let runtime = AgentRuntime::new(
+                task.cfg.clone(),
+                effective_max_steps(&task.mode, task.max_steps),
+            )
+            .with_output(self.output.clone())
+            .with_approval_handler(self.approval_handler.clone());
+            let repo_root = match env::current_dir() {
+                Ok(path) => path,
+                Err(err) => {
+                    self.output
+                        .stderr_line(&format!("failed to resolve current directory: {err}"));
+                    continue;
+                }
+            };
+            let (prompt, effective_preset) =
+                prepare_prompt(&repo_root, task.preset.as_ref(), &task.mode, &task.prompt);
+            maybe_print_inferred_preset_with_output(
+                &*self.output,
+                task.preset.as_ref(),
+                effective_preset.as_ref(),
+            );
+            let client = self.client.with_output(self.output.clone());
+            if let Err(err) = runtime.run_ask(&client, prompt, Some(task.session)).await {
+                self.output.stderr_line(&format!("task failed: {err}"));
+            }
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "grokcli")]
 #[command(about = "Terminal-native Grok agent scaffold")]
@@ -115,34 +264,93 @@ impl ConditionalEventHandler for QueueCurrentLineHandler {
     long_about = "Grok terminal coding agent prototype.\n\nThis CLI runs a deterministic local tool loop with xAI as planner. It supports safe local tool execution, approval-gated actions, patch application, resumable sessions, and an interactive shell when started without a prompt."
 )]
 #[command(
-    after_long_help = "Help Sections\n\nInteractive:\n  Run `grokcli` with no prompt to enter the interactive shell.\n  Type `/` or `/help` to see slash commands.\n  In TTY mode, Up/Down recall history and Tab or Ctrl+Q queue the current line.\n\nModes:\n  ask   Single-turn Q&A or short explanation. Prefer read-only behavior.\n  edit  Multi-step with edits after approval.\n  agent Full iterative tool-calling loop until stop conditions.\n\nSafety:\n  Tiered command policy is enforced by local tools.\n  Use --auto-approve only in trusted repos.\n  Use --verbose-tools or --no-verbose-tools to control live tool traces and tool output rendering.\n\nSessions:\n  Each run writes JSONL events under ~/.local/share/grok-agent/sessions.\n  Use --resume-latest or --resume-session <id|path> to continue."
+    after_long_help = "Help Sections\n\nInteractive:\n  Run `grokcli` with no prompt to enter the interactive shell.\n  Type `/` or `/help` to see slash commands.\n  In TTY mode, Enter submits the current prompt into the background queue, Up/Down recall history, and Tab or Ctrl+Q queue the current line without starting it.\n\nModes:\n  ask   Single-turn Q&A or short explanation. Prefer read-only behavior.\n  edit  Multi-step with edits after approval.\n  agent Full iterative tool-calling loop until stop conditions.\n\nSafety:\n  Tiered command policy is enforced by local tools.\n  Use --auto-approve only in trusted repos.\n  Use --verbose-tools or --no-verbose-tools to control detailed tool previews.\n  Use --queue <prompt> to batch follow-up prompts in non-interactive mode.\n  Use /approve <yes|no> to answer approval requests from queued interactive work.\n\nSessions:\n  Each run writes JSONL events under ~/.local/share/grok-agent/sessions.\n  Use --resume-latest or --resume-session <id|path> to continue."
 )]
 struct Cli {
     #[arg(long, help_heading = "Config", help = "Path to a TOML config file.")]
     config: Option<PathBuf>,
-    #[arg(long, help_heading = "Model", help = "Override model name for this run.")]
+    #[arg(
+        long,
+        help_heading = "Model",
+        help = "Override model name for this run."
+    )]
     model: Option<String>,
-    #[arg(long, value_enum, help_heading = "Runtime", help = "High-level runtime mode.")]
+    #[arg(
+        long,
+        value_enum,
+        help_heading = "Runtime",
+        help = "High-level runtime mode."
+    )]
     mode: Option<AgentMode>,
-    #[arg(long, value_enum, help_heading = "Model", help = "Provider API mode override.")]
+    #[arg(
+        long,
+        value_enum,
+        help_heading = "Model",
+        help = "Provider API mode override."
+    )]
     api_mode: Option<ApiModeOpt>,
-    #[arg(long, help_heading = "Model", help = "Disable streaming output where supported.")]
+    #[arg(
+        long,
+        help_heading = "Model",
+        help = "Disable streaming output where supported."
+    )]
     no_stream: bool,
-    #[arg(long, help_heading = "Safety", help = "Automatically approve approval-gated tool calls.")]
+    #[arg(
+        long,
+        help_heading = "Safety",
+        help = "Automatically approve approval-gated tool calls."
+    )]
     auto_approve: bool,
-    #[arg(long, help_heading = "Runtime", help = "Print tool actions and tool outputs during execution.")]
+    #[arg(
+        long,
+        help_heading = "Runtime",
+        help = "Print detailed tool result previews during execution. Concise tool action/result lines are always shown."
+    )]
     verbose_tools: bool,
-    #[arg(long, help_heading = "Runtime", help = "Suppress tool action and tool output printing during execution.", conflicts_with = "verbose_tools")]
+    #[arg(
+        long,
+        help_heading = "Runtime",
+        help = "Use concise tool action/result lines without detailed tool previews.",
+        conflicts_with = "verbose_tools"
+    )]
     no_verbose_tools: bool,
-    #[arg(long, help_heading = "Patches", help = "Reverse the most recent recorded patch for this repo and exit.")]
+    #[arg(
+        long = "queue",
+        help_heading = "Runtime",
+        help = "Queue an additional prompt to run after the main prompt. Can be passed more than once."
+    )]
+    queue_prompts: Vec<String>,
+    #[arg(
+        long,
+        help_heading = "Patches",
+        help = "Reverse the most recent recorded patch for this repo and exit."
+    )]
     undo_last_patch: bool,
-    #[arg(long, help_heading = "Sessions", help = "Resume a specific session by id (timestamp) or file path.")]
+    #[arg(
+        long,
+        help_heading = "Sessions",
+        help = "Resume a specific session by id (timestamp) or file path."
+    )]
     resume_session: Option<String>,
-    #[arg(long, help_heading = "Sessions", help = "Resume the latest session from session storage.")]
+    #[arg(
+        long,
+        help_heading = "Sessions",
+        help = "Resume the latest session from session storage."
+    )]
     resume_latest: bool,
-    #[arg(long, value_enum, help_heading = "Presets", help = "Apply a workflow prompt preset.")]
+    #[arg(
+        long,
+        value_enum,
+        help_heading = "Presets",
+        help = "Apply a workflow prompt preset."
+    )]
     preset: Option<WorkflowPreset>,
-    #[arg(long, default_value_t = 8, help_heading = "Runtime", help = "Maximum agent loop steps.")]
+    #[arg(
+        long,
+        default_value_t = 8,
+        help_heading = "Runtime",
+        help = "Maximum agent loop steps."
+    )]
     max_steps: u32,
     #[arg(
         long,
@@ -150,7 +358,11 @@ struct Cli {
         help = "Override context budget in bytes for tool outputs."
     )]
     context_budget_bytes: Option<usize>,
-    #[arg(long, help_heading = "Help", help = "Show extended help sections and exit.")]
+    #[arg(
+        long,
+        help_heading = "Help",
+        help = "Show extended help sections and exit."
+    )]
     show_help_sections: bool,
     #[arg(help = "User task prompt.")]
     prompt: Option<String>,
@@ -204,6 +416,13 @@ async fn main() -> Result<()> {
     let header_api_mode = cfg.api_mode.clone();
     let header_auto_approve = cfg.auto_approve;
     let header_verbose_tools = cfg.verbose_tools;
+    let has_primary_prompt = cli
+        .prompt
+        .as_ref()
+        .map(|prompt| !prompt.trim().is_empty())
+        .unwrap_or(false);
+    let cli_tasks = collect_cli_tasks(cli.prompt.clone(), cli.queue_prompts.clone());
+    let total_tasks = cli_tasks.len();
 
     let api_key = cfg.api_key()?;
     let client = XaiClient::new(&api_key, &cfg.base_url, cfg.timeout_seconds)?;
@@ -218,7 +437,7 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    if cli.prompt.is_none() {
+    if cli_tasks.is_empty() {
         let session = match resume_store {
             Some(store) => store,
             None => SessionStore::for_new_session()?,
@@ -229,18 +448,18 @@ async fn main() -> Result<()> {
             max_steps: cli.max_steps,
             preset: cli.preset,
             session,
-            queued_tasks: VecDeque::new(),
+            queued_tasks: Arc::new(Mutex::new(VecDeque::new())),
         };
         return run_interactive_shell(&client, state).await;
     }
 
     let runtime = AgentRuntime::new(cfg, effective_max_steps(&selected_mode, cli.max_steps));
-    let base_prompt = cli
-        .prompt
-        .ok_or_else(|| anyhow::anyhow!("prompt is required unless --undo-last-patch is used"))?;
     let repo_root = env::current_dir()?;
-    let (prompt, effective_preset) =
-        prepare_prompt(&repo_root, cli.preset.as_ref(), &selected_mode, &base_prompt);
+    let first_task = cli_tasks
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("at least one prompt is required"))?;
+    let (_, effective_preset) =
+        prepare_prompt(&repo_root, cli.preset.as_ref(), &selected_mode, first_task);
     print_run_header(
         &selected_mode,
         header_model,
@@ -252,11 +471,33 @@ async fn main() -> Result<()> {
             .as_ref()
             .and_then(|p| p.to_possible_value())
             .map(|v| v.get_name().to_string()),
+        total_tasks.saturating_sub(usize::from(has_primary_prompt)),
         resume_store
             .as_ref()
             .map(|s| s.path().to_string_lossy().to_string()),
     );
-    runtime.run_ask(&client, prompt, resume_store).await?;
+    let session = match resume_store {
+        Some(store) => store,
+        None => SessionStore::for_new_session()?,
+    };
+    for (index, base_prompt) in cli_tasks.into_iter().enumerate() {
+        maybe_print_cli_queue_notice(
+            has_primary_prompt,
+            index,
+            total_tasks.saturating_sub(index + 1),
+            &base_prompt,
+        );
+        let (prompt, effective_preset) = prepare_prompt(
+            &repo_root,
+            cli.preset.as_ref(),
+            &selected_mode,
+            &base_prompt,
+        );
+        maybe_print_inferred_preset(cli.preset.as_ref(), effective_preset.as_ref(), index);
+        runtime
+            .run_ask(&client, prompt, Some(session.clone()))
+            .await?;
+    }
 
     Ok(())
 }
@@ -266,7 +507,7 @@ fn print_help_sections() {
     println!();
     println!("Interactive:");
     println!("  Run `grokcli` with no prompt to enter the interactive shell.");
-    println!("  Type a normal prompt and press Enter to run it.");
+    println!("  Type a normal prompt and press Enter to queue and run it.");
     println!("  Use Up/Down arrow keys to browse command history in TTY mode.");
     println!("  Press Tab or Ctrl+Q to queue the current line for later execution.");
     println!("  Type `/` or `/help` to list slash commands.");
@@ -276,6 +517,7 @@ fn print_help_sections() {
     println!("  `/queue-show` lists queued tasks.");
     println!("  `/queue-run` drains queued tasks now.");
     println!("  `/queue-clear` removes queued tasks.");
+    println!("  `/approve <yes|no>` answers an approval request from a running queued task.");
     println!();
     println!("Modes:");
     println!("  ask   Short Q&A and explanation flows.");
@@ -285,7 +527,8 @@ fn print_help_sections() {
     println!("Safety:");
     println!("  Approval gates apply to risky tools.");
     println!("  --auto-approve bypasses prompts for this run.");
-    println!("  --verbose-tools / --no-verbose-tools toggle live tool traces and tool outputs.");
+    println!("  --verbose-tools / --no-verbose-tools toggle detailed tool previews.");
+    println!("  --queue <text> adds a queued prompt for non-interactive runs.");
     println!();
     println!("Sessions:");
     println!("  Session logs: ~/.local/share/grok-agent/sessions/*.jsonl");
@@ -316,6 +559,25 @@ async fn run_interactive_shell_with_editor(
     if history_path.exists() {
         let _ = editor.load_history(&history_path);
     }
+    let background_runner = match editor.create_external_printer() {
+        Ok(printer) => {
+            let output: Arc<dyn OutputSink> = Arc::new(ExternalPrinterSink::new(printer));
+            let approval_handler = Arc::new(InteractiveApprovalHandler {
+                pending: Arc::new(Mutex::new(None)),
+                output: output.clone(),
+            });
+            Some(BackgroundTaskRunner {
+                client: client.clone(),
+                output,
+                approval_handler,
+                running: Arc::new(AtomicBool::new(false)),
+            })
+        }
+        Err(err) => {
+            eprintln!("external printer unavailable, using foreground prompt execution: {err}");
+            None
+        }
+    };
     let queue_signal = Arc::new(Mutex::new(None));
     let queue_handler = QueueCurrentLineHandler {
         signal: queue_signal.clone(),
@@ -340,11 +602,11 @@ async fn run_interactive_shell_with_editor(
                 }
                 let _ = editor.add_history_entry(line);
                 if action == Some(ReadlineAction::QueueCurrentLine) {
-                    enqueue_task(&mut state, line);
+                    enqueue_task(&state, line);
                     continue;
                 }
                 let outcome =
-                    handle_interactive_line(client, &mut state, line, InputSource::Immediate)
+                    handle_interactive_line(client, &mut state, line, background_runner.as_ref())
                         .await?;
                 match outcome {
                     LineOutcome::Continue => {}
@@ -389,7 +651,7 @@ async fn run_interactive_shell_plain(
         if line.is_empty() {
             continue;
         }
-        match handle_interactive_line(client, state, line, InputSource::Immediate).await? {
+        match handle_interactive_line(client, state, line, None).await? {
             LineOutcome::Continue => {}
             LineOutcome::DrainQueue => {
                 if drain_queued_tasks(client, state).await? {
@@ -406,12 +668,23 @@ async fn handle_interactive_line(
     client: &XaiClient,
     state: &mut InteractiveState,
     line: &str,
-    source: InputSource,
+    background_runner: Option<&BackgroundTaskRunner>,
 ) -> Result<LineOutcome> {
     match parse_interactive_command(line) {
         Ok(InteractiveCommand::Help) => print_interactive_help(),
         Ok(InteractiveCommand::Show) => print_interactive_state(state),
         Ok(InteractiveCommand::Exit) => return Ok(LineOutcome::Exit),
+        Ok(InteractiveCommand::Approve(approved)) => {
+            if let Some(runner) = background_runner {
+                if runner.approval_handler.approve(approved) {
+                    println!("approval={approved}");
+                } else {
+                    println!("no approval request pending");
+                }
+            } else {
+                println!("no approval request pending");
+            }
+        }
         Ok(InteractiveCommand::NewSession) => {
             state.session = SessionStore::for_new_session()?;
             println!("new session: {}", state.session.path().display());
@@ -459,7 +732,9 @@ async fn handle_interactive_line(
         Ok(InteractiveCommand::Preset(preset)) => {
             state.preset = preset;
             match &state.preset {
-                Some(preset) => println!("preset={}", preset.to_possible_value().unwrap().get_name()),
+                Some(preset) => {
+                    println!("preset={}", preset.to_possible_value().unwrap().get_name())
+                }
                 None => println!("preset=off"),
             }
         }
@@ -470,22 +745,26 @@ async fn handle_interactive_line(
         Ok(InteractiveCommand::Queue(text)) => enqueue_task(state, &text),
         Ok(InteractiveCommand::QueueShow) => print_queue(state),
         Ok(InteractiveCommand::QueueClear) => {
-            let cleared = state.queued_tasks.len();
-            state.queued_tasks.clear();
+            let cleared = clear_queued_tasks(state);
             println!("cleared {cleared} queued task(s)");
         }
         Ok(InteractiveCommand::QueueRun) => {
-            if state.queued_tasks.is_empty() {
+            if queued_task_count(state) == 0 {
                 println!("queue is empty");
                 return Ok(LineOutcome::Continue);
             }
-            if matches!(source, InputSource::Queued) {
-                println!("queue already running");
+            if let Some(runner) = background_runner {
+                runner.start_if_idle(state.clone());
             } else {
                 return Ok(LineOutcome::DrainQueue);
             }
         }
         Ok(InteractiveCommand::Prompt(prompt)) => {
+            if let Some(runner) = background_runner {
+                enqueue_task(state, &prompt);
+                runner.start_if_idle(state.clone());
+                return Ok(LineOutcome::Continue);
+            }
             let runtime = AgentRuntime::new(
                 state.cfg.clone(),
                 effective_max_steps(&state.mode, state.max_steps),
@@ -503,7 +782,7 @@ async fn handle_interactive_line(
             runtime
                 .run_ask(client, prompt, Some(state.session.clone()))
                 .await?;
-            if matches!(source, InputSource::Immediate) && !state.queued_tasks.is_empty() {
+            if queued_task_count(state) > 0 {
                 return Ok(LineOutcome::DrainQueue);
             }
         }
@@ -515,8 +794,8 @@ async fn handle_interactive_line(
 fn print_interactive_banner(state: &InteractiveState) {
     println!("Interactive shell");
     println!("session={}", state.session.path().display());
-    println!("type a prompt and press Enter");
-    println!("press Tab or Ctrl+Q to queue the current line");
+    println!("type a prompt and press Enter to queue and run it");
+    println!("use /queue <text> or press Tab/Ctrl+Q to queue work");
     println!("use Up/Down to browse history");
     println!("type / or /help for commands, /exit to quit");
     print_interactive_state(state);
@@ -524,9 +803,11 @@ fn print_interactive_banner(state: &InteractiveState) {
 
 fn print_interactive_help() {
     println!("Use Up/Down arrow keys for history in TTY mode.");
-    println!("Press Tab or Ctrl+Q to queue the current line.");
+    println!("Press Enter to queue the prompt and start work immediately.");
+    println!("Use /queue <text> or press Tab/Ctrl+Q to queue additional work.");
     println!("/help");
     println!("/show");
+    println!("/approve <yes|no>");
     println!("/exit");
     println!("/new-session");
     println!("/resume-latest");
@@ -564,8 +845,23 @@ fn print_interactive_state(state: &InteractiveState) {
         state.cfg.stream,
         preset,
         state.cfg.context_budget_bytes,
-        state.queued_tasks.len(),
+        queued_task_count(state),
     );
+}
+
+fn collect_cli_tasks(prompt: Option<String>, queued_prompts: Vec<String>) -> Vec<String> {
+    let mut tasks = Vec::new();
+    if let Some(prompt) = prompt {
+        if !prompt.trim().is_empty() {
+            tasks.push(prompt);
+        }
+    }
+    for prompt in queued_prompts {
+        if !prompt.trim().is_empty() {
+            tasks.push(prompt);
+        }
+    }
+    tasks
 }
 
 fn parse_interactive_command(line: &str) -> Result<InteractiveCommand, String> {
@@ -581,6 +877,10 @@ fn parse_interactive_command(line: &str) -> Result<InteractiveCommand, String> {
     match cmd {
         "/show" => Ok(InteractiveCommand::Show),
         "/exit" | "/quit" => Ok(InteractiveCommand::Exit),
+        "/approve" => parts
+            .next()
+            .ok_or_else(|| "usage: /approve <yes|no>".to_string())
+            .and_then(parse_approve_command),
         "/new-session" | "/new_session" => Ok(InteractiveCommand::NewSession),
         "/resume-latest" | "/resume_latest" => Ok(InteractiveCommand::ResumeLatest),
         "/resume" => parts
@@ -606,7 +906,11 @@ fn parse_interactive_command(line: &str) -> Result<InteractiveCommand, String> {
         "/max-steps" | "/max_steps" => parts
             .next()
             .ok_or_else(|| "usage: /max-steps <n>".to_string())
-            .and_then(|s| s.parse::<u32>().map(InteractiveCommand::MaxSteps).map_err(|_| "invalid step count".to_string())),
+            .and_then(|s| {
+                s.parse::<u32>()
+                    .map(InteractiveCommand::MaxSteps)
+                    .map_err(|_| "invalid step count".to_string())
+            }),
         "/auto-approve" | "/auto_approve" => parts
             .next()
             .ok_or_else(|| "usage: /auto-approve <on|off>".to_string())
@@ -629,7 +933,11 @@ fn parse_interactive_command(line: &str) -> Result<InteractiveCommand, String> {
         "/context-budget" | "/context_budget" => parts
             .next()
             .ok_or_else(|| "usage: /context-budget <bytes>".to_string())
-            .and_then(|s| s.parse::<usize>().map(InteractiveCommand::ContextBudget).map_err(|_| "invalid byte count".to_string())),
+            .and_then(|s| {
+                s.parse::<usize>()
+                    .map(InteractiveCommand::ContextBudget)
+                    .map_err(|_| "invalid byte count".to_string())
+            }),
         "/queue" => {
             let rest = line.trim_start_matches("/queue").trim();
             if rest.is_empty() {
@@ -672,11 +980,21 @@ fn parse_bool_command(value: &str) -> Result<bool, String> {
     }
 }
 
+fn parse_approve_command(value: &str) -> Result<InteractiveCommand, String> {
+    match value {
+        "yes" | "y" => Ok(InteractiveCommand::Approve(true)),
+        "no" | "n" => Ok(InteractiveCommand::Approve(false)),
+        _ => Err("usage: /approve <yes|no>".to_string()),
+    }
+}
+
 fn parse_preset_command(value: &str) -> Result<InteractiveCommand, String> {
     match value {
         "rust-tests" => Ok(InteractiveCommand::Preset(Some(WorkflowPreset::RustTests))),
         "swift-build" => Ok(InteractiveCommand::Preset(Some(WorkflowPreset::SwiftBuild))),
-        "review-changed" => Ok(InteractiveCommand::Preset(Some(WorkflowPreset::ReviewChanged))),
+        "review-changed" => Ok(InteractiveCommand::Preset(Some(
+            WorkflowPreset::ReviewChanged,
+        ))),
         "off" => Ok(InteractiveCommand::Preset(None)),
         _ => Err("usage: /preset <rust-tests|swift-build|review-changed|off>".to_string()),
     }
@@ -699,44 +1017,106 @@ fn take_readline_action(signal: &Arc<Mutex<Option<ReadlineAction>>>) -> Option<R
     signal.lock().ok().and_then(|mut state| state.take())
 }
 
-fn enqueue_task(state: &mut InteractiveState, line: &str) {
-    state.queued_tasks.push_back(line.to_string());
+fn enqueue_task(state: &InteractiveState, line: &str) {
+    if let Ok(mut queued) = state.queued_tasks.lock() {
+        queued.push_back(snapshot_queued_task(state, line));
+    }
     println!(
         "queued[{}]: {}",
-        state.queued_tasks.len(),
+        queued_task_count(state),
         summarize_queue_entry(line)
     );
 }
 
 fn print_queue(state: &InteractiveState) {
-    if state.queued_tasks.is_empty() {
+    let queued = queued_task_summaries(state);
+    if queued.is_empty() {
         println!("queue is empty");
         return;
     }
 
-    for (index, entry) in state.queued_tasks.iter().enumerate() {
-        println!("{}: {}", index + 1, summarize_queue_entry(entry));
+    for (index, entry) in queued.iter().enumerate() {
+        println!("{}: {}", index + 1, entry);
     }
 }
 
 async fn drain_queued_tasks(client: &XaiClient, state: &mut InteractiveState) -> Result<bool> {
     let mut processed = 0usize;
-    while let Some(line) = state.queued_tasks.pop_front() {
+    while let Some(task) = pop_queued_task(state) {
         processed += 1;
         println!(
             "running queued[{}] remaining={} {}",
             processed,
-            state.queued_tasks.len(),
-            summarize_queue_entry(&line)
+            queued_task_count(state),
+            summarize_queue_entry(&task.prompt)
         );
-        match handle_interactive_line(client, state, &line, InputSource::Queued).await? {
-            LineOutcome::Continue => {}
-            LineOutcome::DrainQueue => {}
-            LineOutcome::Exit => return Ok(true),
-        }
+        run_task_foreground(client, task).await?;
     }
 
     Ok(false)
+}
+
+fn snapshot_queued_task(state: &InteractiveState, line: &str) -> QueuedPromptTask {
+    QueuedPromptTask {
+        prompt: line.to_string(),
+        cfg: state.cfg.clone(),
+        mode: state.mode.clone(),
+        max_steps: state.max_steps,
+        preset: state.preset.clone(),
+        session: state.session.clone(),
+    }
+}
+
+fn queued_task_count(state: &InteractiveState) -> usize {
+    state
+        .queued_tasks
+        .lock()
+        .map(|queued| queued.len())
+        .unwrap_or(0)
+}
+
+fn queued_task_summaries(state: &InteractiveState) -> Vec<String> {
+    state
+        .queued_tasks
+        .lock()
+        .map(|queued| {
+            queued
+                .iter()
+                .map(|task| summarize_queue_entry(&task.prompt))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn pop_queued_task(state: &InteractiveState) -> Option<QueuedPromptTask> {
+    state
+        .queued_tasks
+        .lock()
+        .ok()
+        .and_then(|mut queued| queued.pop_front())
+}
+
+fn clear_queued_tasks(state: &InteractiveState) -> usize {
+    match state.queued_tasks.lock() {
+        Ok(mut queued) => {
+            let cleared = queued.len();
+            queued.clear();
+            cleared
+        }
+        Err(_) => 0,
+    }
+}
+
+async fn run_task_foreground(client: &XaiClient, task: QueuedPromptTask) -> Result<()> {
+    let runtime = AgentRuntime::new(
+        task.cfg.clone(),
+        effective_max_steps(&task.mode, task.max_steps),
+    );
+    let repo_root = env::current_dir()?;
+    let (prompt, effective_preset) =
+        prepare_prompt(&repo_root, task.preset.as_ref(), &task.mode, &task.prompt);
+    maybe_print_inferred_preset_direct(task.preset.as_ref(), effective_preset.as_ref());
+    runtime.run_ask(client, prompt, Some(task.session)).await
 }
 
 fn summarize_queue_entry(line: &str) -> String {
@@ -751,6 +1131,24 @@ fn summarize_queue_entry(line: &str) -> String {
     } else {
         preview
     }
+}
+
+fn maybe_print_cli_queue_notice(
+    has_primary_prompt: bool,
+    index: usize,
+    remaining: usize,
+    prompt: &str,
+) {
+    if has_primary_prompt && index == 0 {
+        return;
+    }
+    let queue_index = if has_primary_prompt { index } else { index + 1 };
+    eprintln!(
+        "running queued[{}] remaining={} {}",
+        queue_index,
+        remaining,
+        summarize_queue_entry(prompt)
+    );
 }
 
 fn interactive_history_path() -> Result<PathBuf> {
@@ -798,11 +1196,18 @@ fn print_run_header(
     auto_approve: bool,
     verbose_tools: bool,
     effective_preset: Option<String>,
+    queued_tasks: usize,
     resumed_session: Option<String>,
 ) {
     eprintln!(
-        "mode={} model={} api_mode={} max_steps={} auto_approve={} verbose_tools={}",
-        mode_name(mode), model, api_mode, max_steps, auto_approve, verbose_tools
+        "mode={} model={} api_mode={} max_steps={} auto_approve={} verbose_tools={} queued={}",
+        mode_name(mode),
+        model,
+        api_mode,
+        max_steps,
+        auto_approve,
+        verbose_tools,
+        queued_tasks
     );
     if let Some(preset) = effective_preset {
         eprintln!("effective_preset={preset}");
@@ -812,14 +1217,67 @@ fn print_run_header(
     }
 }
 
+fn maybe_print_inferred_preset(
+    configured_preset: Option<&WorkflowPreset>,
+    effective_preset: Option<&WorkflowPreset>,
+    task_index: usize,
+) {
+    if configured_preset.is_some() || task_index == 0 {
+        return;
+    }
+    if let Some(preset) = effective_preset {
+        if let Some(value) = preset.to_possible_value() {
+            eprintln!("inferred_preset={}", value.get_name());
+        }
+    }
+}
+
+fn maybe_print_inferred_preset_direct(
+    configured_preset: Option<&WorkflowPreset>,
+    effective_preset: Option<&WorkflowPreset>,
+) {
+    if configured_preset.is_some() {
+        return;
+    }
+    if let Some(preset) = effective_preset {
+        if let Some(value) = preset.to_possible_value() {
+            eprintln!("inferred_preset={}", value.get_name());
+        }
+    }
+}
+
+fn maybe_print_inferred_preset_with_output(
+    output: &dyn OutputSink,
+    configured_preset: Option<&WorkflowPreset>,
+    effective_preset: Option<&WorkflowPreset>,
+) {
+    if configured_preset.is_some() {
+        return;
+    }
+    if let Some(preset) = effective_preset {
+        if let Some(value) = preset.to_possible_value() {
+            output.stderr_line(&format!("inferred_preset={}", value.get_name()));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn parse_help_command() {
         match parse_interactive_command("/") {
             Ok(InteractiveCommand::Help) => {}
+            other => panic!("unexpected parse result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_approve_command() {
+        match parse_interactive_command("/approve yes") {
+            Ok(InteractiveCommand::Approve(value)) => assert!(value),
             other => panic!("unexpected parse result: {:?}", other),
         }
     }
@@ -877,8 +1335,11 @@ mod tests {
     #[test]
     fn prepare_prompt_infers_swift_build_for_non_ask_mode() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("Package.swift"), "// swift-tools-version:5.3\n")
-            .expect("write Package.swift");
+        std::fs::write(
+            dir.path().join("Package.swift"),
+            "// swift-tools-version:5.3\n",
+        )
+        .expect("write Package.swift");
         let (prompt, preset) = prepare_prompt(
             dir.path(),
             None,
@@ -892,8 +1353,11 @@ mod tests {
     #[test]
     fn prepare_prompt_does_not_infer_for_ask_mode() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("Package.swift"), "// swift-tools-version:5.3\n")
-            .expect("write Package.swift");
+        std::fs::write(
+            dir.path().join("Package.swift"),
+            "// swift-tools-version:5.3\n",
+        )
+        .expect("write Package.swift");
         let (prompt, preset) = prepare_prompt(
             dir.path(),
             None,
@@ -905,5 +1369,45 @@ mod tests {
             "swift test fails with cannot find 'Application' in scope"
         );
         assert_eq!(preset, None);
+    }
+
+    #[test]
+    fn cli_accepts_no_verbose_tools_with_prompt() {
+        let cli =
+            Cli::try_parse_from(["grokcli", "--no-verbose-tools", "fix failing tests"]).unwrap();
+        assert!(cli.no_verbose_tools);
+        assert_eq!(cli.prompt.as_deref(), Some("fix failing tests"));
+    }
+
+    #[test]
+    fn cli_collects_queued_prompts() {
+        let cli = Cli::try_parse_from([
+            "grokcli",
+            "--queue",
+            "inspect build",
+            "--queue",
+            "rerun tests",
+            "fix failing tests",
+        ])
+        .unwrap();
+        assert_eq!(cli.queue_prompts.len(), 2);
+        assert_eq!(cli.queue_prompts[0], "inspect build");
+        assert_eq!(cli.queue_prompts[1], "rerun tests");
+    }
+
+    #[test]
+    fn collect_cli_tasks_keeps_prompt_then_queue_order() {
+        let tasks = collect_cli_tasks(
+            Some("fix failing tests".to_string()),
+            vec!["inspect build".to_string(), "rerun tests".to_string()],
+        );
+        assert_eq!(
+            tasks,
+            vec![
+                "fix failing tests".to_string(),
+                "inspect build".to_string(),
+                "rerun tests".to_string()
+            ]
+        );
     }
 }

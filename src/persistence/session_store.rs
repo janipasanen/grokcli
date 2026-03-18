@@ -129,7 +129,10 @@ pub fn latest_session_path() -> Result<Option<PathBuf>> {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
         let key = stem.parse::<u128>().unwrap_or(0);
         match &best {
             Some((current, _)) if *current >= key => {}

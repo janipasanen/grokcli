@@ -54,6 +54,10 @@ mod tests {
         let mut budget = ContextBudgetManager::new(32);
         let payload = json!({ "data": "x".repeat(200) });
         let out = budget.fit_tool_output(payload);
-        assert!(out.get("budget_truncated").and_then(|v| v.as_bool()).unwrap_or(false));
+        assert!(
+            out.get("budget_truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        );
     }
 }

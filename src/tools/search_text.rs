@@ -40,12 +40,14 @@ pub fn run(repo_root: &Path, args: SearchTextArgs) -> Result<SearchTextResult> {
     let (stdout, stdout_truncated) = truncate_output(&String::from_utf8_lossy(&output.stdout));
     let (stderr, stderr_truncated) = truncate_output(&String::from_utf8_lossy(&output.stderr));
     let line_count = stdout.lines().count();
-    let was_truncated = line_count >= max.parse::<usize>().unwrap_or(200)
-        || stdout_truncated
-        || stderr_truncated;
+    let was_truncated =
+        line_count >= max.parse::<usize>().unwrap_or(200) || stdout_truncated || stderr_truncated;
 
     Ok(SearchTextResult {
-        command: format!("rg --line-number --no-heading -m {max} '{}' {rel}", args.pattern),
+        command: format!(
+            "rg --line-number --no-heading -m {max} '{}' {rel}",
+            args.pattern
+        ),
         exit_code,
         stdout,
         stderr,

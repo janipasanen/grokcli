@@ -59,11 +59,11 @@ impl AppConfig {
         let resolved = config_path.or_else(default_config_path);
         match resolved {
             Some(path) if path.exists() => {
-                let raw = fs::read_to_string(&path).with_context(|| {
-                    format!("failed to read config file at {}", path.display())
+                let raw = fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read config file at {}", path.display()))?;
+                let cfg = toml::from_str::<Self>(&raw).with_context(|| {
+                    format!("failed to parse TOML config at {}", path.display())
                 })?;
-                let cfg = toml::from_str::<Self>(&raw)
-                    .with_context(|| format!("failed to parse TOML config at {}", path.display()))?;
                 Ok(cfg)
             }
             _ => Ok(Self::default()),

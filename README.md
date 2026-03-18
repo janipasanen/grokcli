@@ -95,23 +95,24 @@ grokcli --show-help-sections
 
 ### Interactive shell
 
-Starting `grokcli` with no prompt opens a text-entry shell. Type a normal prompt and press Enter to run it. Type `/` or `/help` to see the available slash commands.
+Starting `grokcli` with no prompt opens a text-entry shell. In the TTY shell, pressing Enter queues the prompt and starts it immediately in the background so you can keep typing follow-up prompts. Type `/` or `/help` to see the available slash commands.
 
 In a normal terminal TTY, the shell supports command history with the Up and Down arrow keys. History is stored at `~/.local/share/grok-agent/history.txt`, so previously entered prompts and slash commands are available across shell sessions.
 
-In the same TTY mode, you can queue follow-up tasks without running them immediately. Type a prompt and press `Tab` or `Ctrl+Q` to add it to the FIFO queue. Queued tasks run automatically after the next normal prompt finishes, or you can start them explicitly with `/queue-run`.
+In the same TTY mode, you can queue follow-up tasks without running them immediately. Use `/queue <text>` to add a task to the FIFO queue, or type a prompt and press `Tab` or `Ctrl+Q` to enqueue the current line. Queued tasks run sequentially in the background, and you can start queued-only work explicitly with `/queue-run`.
 
 For Rust and Swift repositories, `agent` and `edit` mode now auto-infer a repair workflow when your prompt clearly describes a build or test failure. That means prompts like "swift test fails" or "cargo test fails" will automatically bias the agent toward `run_tests`, `build_project`, focused file reads, `apply_patch`, and verification reruns even if you do not manually set a preset.
 
 Common interactive commands:
 
 - `/show` prints the current mode, model, API mode, step limit, approval mode, preset, and context budget.
+- `/approve <yes|no>` answers an approval request from a queued task.
 - `/mode <ask|edit|agent>` switches between single-turn and multi-step behavior.
 - `/model <name>` changes the Grok model for the current shell session.
 - `/api-mode <responses|chat-completions>` switches the provider path.
 - `/max-steps <n>` changes the agent loop limit for `edit` and `agent` mode.
 - `/auto-approve <on|off>` toggles approval bypass.
-- `/verbose-tools <on|off>` toggles live tool traces and tool output previews.
+- `/verbose-tools <on|off>` toggles detailed tool previews. Concise tool action/result lines still print either way.
 - `/stream <on|off>` toggles streaming output.
 - `/preset <rust-tests|swift-build|review-changed|off>` applies or clears a workflow preset.
 - `/queue <text>` adds a prompt to the queue without running it.
@@ -137,11 +138,14 @@ Example shell session:
 $ grokcli
 grok> /mode agent
 grok> /model grok-code-fast-1
-grok> inspect migration failures<Tab>
-grok> verify all checkout tests<Tab>
 grok> inspect this repo and tell me why the build fails
-running queued[1] remaining=1 inspect migration failures
-running queued[2] remaining=0 verify all checkout tests
+queued[1]: inspect this repo and tell me why the build fails
+grok> /queue inspect migration failures
+queued[2]: inspect migration failures
+grok> /queue verify all checkout tests
+queued[3]: verify all checkout tests
+running queued[1] remaining=2 inspect this repo and tell me why the build fails
+tool> run_tests language="rust" command="cargo test"
 grok> /show
 grok> /exit
 ```
@@ -153,9 +157,12 @@ Common options:
 - `--mode ask|edit|agent` controls how aggressive the loop is.
 - `--max-steps N` caps the tool loop steps.
 - `--auto-approve` skips interactive approval prompts.
-- `--verbose-tools` forces live tool traces/output on, while `--no-verbose-tools` suppresses them.
+- `--verbose-tools` enables detailed tool previews, while `--no-verbose-tools` keeps concise tool action/result lines only.
+- `--queue <prompt>` appends a follow-up prompt to run in the same non-interactive session. Pass it more than once to batch multiple prompts.
 - `--resume-latest` or `--resume-session <id|path>` continues an earlier session.
 - `--context-budget-bytes N` limits tool output passed back to the model.
+
+The CLI always prints short `tool>` / `tool<` lines for each tool action and result. With `verbose_tools` enabled it also prints detailed previews such as file contents, directory listings, and labeled `stdout` / `stderr` blocks.
 
 Examples:
 
@@ -168,6 +175,9 @@ grokcli --mode agent --max-steps 12 "fix failing tests"
 
 # Agent mode without live tool chatter
 grokcli --mode agent --no-verbose-tools "fix failing tests"
+
+# Batch multiple prompts in one session
+grokcli --mode agent --queue "inspect build logs" --queue "rerun checkout tests" "fix failing tests"
 
 # Use a preset workflow
 grokcli --preset rust-tests "fix the failing tests"

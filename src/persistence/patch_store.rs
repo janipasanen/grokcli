@@ -122,7 +122,9 @@ fn git_apply_reverse(repo_root: &Path, patch: &str) -> Result<(bool, String)> {
             .write_all(patch.as_bytes())
             .context("failed to write patch to stdin")?;
     }
-    let output = child.wait_with_output().context("failed to wait for git apply -R")?;
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for git apply -R")?;
     let ok = output.status.success();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     Ok((ok, stderr))

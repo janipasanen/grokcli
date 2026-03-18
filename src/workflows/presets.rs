@@ -77,8 +77,11 @@ mod tests {
     #[test]
     fn infers_swift_build_preset_for_swift_failure_prompt() {
         let dir = tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("Package.swift"), "// swift-tools-version:5.3\n")
-            .expect("write Package.swift");
+        std::fs::write(
+            dir.path().join("Package.swift"),
+            "// swift-tools-version:5.3\n",
+        )
+        .expect("write Package.swift");
         let preset = infer_preset_for_prompt(
             dir.path(),
             "swift test fails with cannot find 'Application' in scope",

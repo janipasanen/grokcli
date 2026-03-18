@@ -1,10 +1,11 @@
 use crate::agent::context_budget::ContextBudgetManager;
 use crate::agent::instructions::{build_multi_step_instructions, build_single_step_instructions};
 use crate::config::config::AppConfig;
+use crate::output::{OutputSink, StdOutputSink};
 use crate::persistence::patch_store::PatchStore;
 use crate::persistence::session_store::SessionStore;
-use crate::provider::models::build_simple_request;
 use crate::provider::LanguageModelProvider;
+use crate::provider::models::build_simple_request;
 use crate::tools::registry::{ToolCallRequest, ToolCallResult, ToolRegistry};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -12,10 +13,25 @@ use std::collections::HashSet;
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
+use std::sync::Arc;
 
 pub struct AgentRuntime {
     cfg: AppConfig,
     max_steps: u32,
+    output: Arc<dyn OutputSink>,
+    approval_handler: Arc<dyn ApprovalHandler>,
+}
+
+pub trait ApprovalHandler: Send + Sync {
+    fn request_approval(&self, action: &str, reason: Option<&str>) -> Result<bool>;
+}
+
+pub struct StdioApprovalHandler;
+
+impl ApprovalHandler for StdioApprovalHandler {
+    fn request_approval(&self, action: &str, reason: Option<&str>) -> Result<bool> {
+        prompt_user_approval(action, reason)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -33,7 +49,22 @@ struct VerificationFailure {
 
 impl AgentRuntime {
     pub fn new(cfg: AppConfig, max_steps: u32) -> Self {
-        Self { cfg, max_steps }
+        Self {
+            cfg,
+            max_steps,
+            output: Arc::new(StdOutputSink),
+            approval_handler: Arc::new(StdioApprovalHandler),
+        }
+    }
+
+    pub fn with_output(mut self, output: Arc<dyn OutputSink>) -> Self {
+        self.output = output;
+        self
+    }
+
+    pub fn with_approval_handler(mut self, approval_handler: Arc<dyn ApprovalHandler>) -> Self {
+        self.approval_handler = approval_handler;
+        self
     }
 
     pub async fn run_ask(
@@ -93,7 +124,7 @@ impl AgentRuntime {
                 request.instructions = Some(single_step_instructions.clone());
                 let resp = if self.cfg.stream {
                     let t = client.stream_response_text(&request).await;
-                    println!();
+                    self.output.stdout_line("");
                     t
                 } else {
                     client.create_response_text(&request).await
@@ -101,7 +132,9 @@ impl AgentRuntime {
                 match resp {
                     Ok(t) => t,
                     Err(err) if is_not_found_error(&err) => {
-                        eprintln!("responses endpoint unavailable, falling back to /v1/chat/completions");
+                        self.output.stderr_line(
+                            "responses endpoint unavailable, falling back to /v1/chat/completions",
+                        );
                         let body = json!({
                             "model": normalize_model_name(&self.cfg.model),
                             "messages": [
@@ -126,10 +159,12 @@ impl AgentRuntime {
                 }
             };
             if !text.trim().is_empty() {
-                println!("{text}");
+                self.output.stdout_line(&text);
             }
             session.append("assistant_message", SessionStore::assistant_payload(&text))?;
-            eprintln!("session log: {}", session.path().display());
+            self.output
+                .stderr_line(&format!("session log: {}", session.path().display()));
+            self.output.flush();
             return Ok(());
         }
 
@@ -144,7 +179,7 @@ impl AgentRuntime {
                 &mut approval_cache,
                 prompt,
             )
-                .await?;
+            .await?;
         } else {
             match self
                 .run_responses_loop(
@@ -161,8 +196,8 @@ impl AgentRuntime {
                 Ok(()) => {}
                 Err(err) => {
                     if is_not_found_error(&err) {
-                        eprintln!(
-                            "responses endpoint unavailable, falling back to /v1/chat/completions"
+                        self.output.stderr_line(
+                            "responses endpoint unavailable, falling back to /v1/chat/completions",
                         );
                         self.run_chat_completions_loop(
                             client,
@@ -179,7 +214,9 @@ impl AgentRuntime {
                 }
             }
         }
-        eprintln!("session log: {}", session.path().display());
+        self.output
+            .stderr_line(&format!("session log: {}", session.path().display()));
+        self.output.flush();
         Ok(())
     }
 }
@@ -229,8 +266,8 @@ impl AgentRuntime {
         let instructions = build_multi_step_instructions(repo_root);
         let store = true;
         if !self.cfg.store {
-            eprintln!(
-                "forcing store=true for multi-step Responses mode so previous_response_id works"
+            self.output.stderr_line(
+                "forcing store=true for multi-step Responses mode so previous_response_id works",
             );
         }
         let mut pending_input = vec![json!({
@@ -267,10 +304,10 @@ impl AgentRuntime {
                         value
                     }
                     Err(err) => {
-                        eprintln!(
+                        self.output.stderr_line(&format!(
                             "streaming failed, falling back to non-streaming: {}",
                             err
-                        );
+                        ));
                         let mut fallback_body = body.clone();
                         if let Some(obj) = fallback_body.as_object_mut() {
                             obj.insert("stream".to_string(), json!(false));
@@ -290,18 +327,21 @@ impl AgentRuntime {
             let text = extract_text(&response);
             if !text.trim().is_empty() {
                 if step > 0 && !streamed {
-                    println!();
+                    self.output.stdout_line("");
                 }
                 if !streamed {
-                    print!("{text}");
+                    self.output.stdout(&text);
                 }
                 session.append("assistant_message", SessionStore::assistant_payload(&text))?;
             }
 
             let tool_calls = extract_tool_calls(&response);
+            if !tool_calls.is_empty() {
+                self.output.flush();
+            }
             if tool_calls.is_empty() {
                 if let Some(reminder) = verification_followup_message(&verification) {
-                    eprintln!("{reminder}");
+                    self.output.stderr_line(&reminder);
                     session.append(
                         "runtime_notice",
                         json!({
@@ -315,7 +355,7 @@ impl AgentRuntime {
                     })];
                     continue;
                 }
-                println!();
+                self.output.stdout_line("");
                 completed = true;
                 break;
             }
@@ -332,17 +372,17 @@ impl AgentRuntime {
                       "action": action
                     }),
                 )?;
-                if self.cfg.verbose_tools {
-                    eprintln!("tool: {action}");
-                }
+                self.output.stderr_line(&format!("tool> {action}"));
                 let Some(result) = self.execute_with_approval(
                     registry,
                     session,
                     approval_cache,
                     &call.name,
                     &call.arguments,
-                )? else {
-                    eprintln!("tool '{}' was not approved; stopping.", call.name);
+                )?
+                else {
+                    self.output
+                        .stderr_line(&format!("tool '{}' was not approved; stopping.", call.name));
                     return Ok(());
                 };
                 session.append(
@@ -353,21 +393,19 @@ impl AgentRuntime {
                       "call_id": call.call_id
                     }),
                 )?;
-                emit_tool_notice(
-                    session,
-                    &call.name,
-                    &result.result,
-                    self.cfg.verbose_tools,
-                )?;
+                emit_tool_notice(session, &call.name, &result.result, self.cfg.verbose_tools)?;
                 update_verification_state(
                     &mut verification,
                     &call.name,
                     &call.arguments,
                     &result.result,
                 );
-                if self.cfg.verbose_tools {
-                    emit_tool_result_preview(&call.name, &result.result);
-                }
+                emit_tool_result_preview(
+                    &*self.output,
+                    &call.name,
+                    &result.result,
+                    self.cfg.verbose_tools,
+                );
                 maybe_record_applied_patch(
                     &call.name,
                     &call.arguments,
@@ -384,14 +422,14 @@ impl AgentRuntime {
             }
 
             if outputs.is_empty() {
-                println!();
+                self.output.stdout_line("");
                 break;
             } else {
                 pending_input = outputs;
             }
         }
         if !completed {
-            emit_max_steps_notice(session, self.max_steps)?;
+            emit_max_steps_notice(session, self.max_steps, &*self.output)?;
         }
         Ok(())
     }
@@ -438,11 +476,11 @@ impl AgentRuntime {
                 .and_then(Value::as_array)
                 .and_then(|arr| arr.first())
             else {
-                println!();
+                self.output.stdout_line("");
                 break;
             };
             let Some(message) = choice.get("message") else {
-                println!();
+                self.output.stdout_line("");
                 break;
             };
 
@@ -453,9 +491,9 @@ impl AgentRuntime {
                 .to_string();
             if !text.trim().is_empty() {
                 if step > 0 {
-                    println!();
+                    self.output.stdout_line("");
                 }
-                print!("{text}");
+                self.output.stdout(&text);
                 session.append("assistant_message", SessionStore::assistant_payload(&text))?;
             }
 
@@ -466,9 +504,12 @@ impl AgentRuntime {
             }));
 
             let tool_calls = extract_chat_tool_calls(message);
+            if !tool_calls.is_empty() {
+                self.output.flush();
+            }
             if tool_calls.is_empty() {
                 if let Some(reminder) = verification_followup_message(&verification) {
-                    eprintln!("{reminder}");
+                    self.output.stderr_line(&reminder);
                     session.append(
                         "runtime_notice",
                         json!({
@@ -482,7 +523,7 @@ impl AgentRuntime {
                     }));
                     continue;
                 }
-                println!();
+                self.output.stdout_line("");
                 completed = true;
                 break;
             }
@@ -498,17 +539,17 @@ impl AgentRuntime {
                       "action": action
                     }),
                 )?;
-                if self.cfg.verbose_tools {
-                    eprintln!("tool: {action}");
-                }
+                self.output.stderr_line(&format!("tool> {action}"));
                 let Some(result) = self.execute_with_approval(
                     registry,
                     session,
                     approval_cache,
                     &call.name,
                     &call.arguments,
-                )? else {
-                    eprintln!("tool '{}' was not approved; stopping.", call.name);
+                )?
+                else {
+                    self.output
+                        .stderr_line(&format!("tool '{}' was not approved; stopping.", call.name));
                     return Ok(());
                 };
                 session.append(
@@ -519,21 +560,19 @@ impl AgentRuntime {
                       "call_id": call.call_id
                     }),
                 )?;
-                emit_tool_notice(
-                    session,
-                    &call.name,
-                    &result.result,
-                    self.cfg.verbose_tools,
-                )?;
+                emit_tool_notice(session, &call.name, &result.result, self.cfg.verbose_tools)?;
                 update_verification_state(
                     &mut verification,
                     &call.name,
                     &call.arguments,
                     &result.result,
                 );
-                if self.cfg.verbose_tools {
-                    emit_tool_result_preview(&call.name, &result.result);
-                }
+                emit_tool_result_preview(
+                    &*self.output,
+                    &call.name,
+                    &result.result,
+                    self.cfg.verbose_tools,
+                );
                 maybe_record_applied_patch(
                     &call.name,
                     &call.arguments,
@@ -551,7 +590,7 @@ impl AgentRuntime {
         }
 
         if !completed {
-            emit_max_steps_notice(session, self.max_steps)?;
+            emit_max_steps_notice(session, self.max_steps, &*self.output)?;
         }
 
         Ok(())
@@ -577,7 +616,7 @@ impl AgentRuntime {
         let reason = approval_reason(&first.result);
         if name == "apply_patch" {
             if let Some(patch) = args.get("patch").and_then(Value::as_str) {
-                render_patch_preview(patch);
+                render_patch_preview(&*self.output, patch);
             }
         }
         let cache_key = approval_cache_key(name, args, reason.as_deref());
@@ -608,7 +647,8 @@ impl AgentRuntime {
         let approved = if self.cfg.auto_approve {
             true
         } else {
-            prompt_user_approval(&action, reason.as_deref())?
+            self.approval_handler
+                .request_approval(&action, reason.as_deref())?
         };
 
         session.append(
@@ -630,7 +670,11 @@ impl AgentRuntime {
     }
 }
 
-fn rerun_with_approved(registry: &ToolRegistry, name: &str, args: &Value) -> Result<ToolCallResult> {
+fn rerun_with_approved(
+    registry: &ToolRegistry,
+    name: &str,
+    args: &Value,
+) -> Result<ToolCallResult> {
     let mut approved_args = args.clone();
     if let Some(map) = approved_args.as_object_mut() {
         map.insert("approved".to_string(), json!(true));
@@ -800,16 +844,16 @@ fn prompt_user_approval(action: &str, reason: Option<&str>) -> Result<bool> {
     Ok(normalized == "y" || normalized == "yes")
 }
 
-fn render_patch_preview(patch: &str) {
+fn render_patch_preview(output: &dyn OutputSink, patch: &str) {
     const MAX_LINES: usize = 200;
-    eprintln!("patch preview:");
+    output.stderr_line("patch preview:");
     let mut count = 0usize;
     for line in patch.lines() {
         if count >= MAX_LINES {
-            eprintln!("...[patch preview truncated]...");
+            output.stderr_line("...[patch preview truncated]...");
             break;
         }
-        eprintln!("{line}");
+        output.stderr_line(line);
         count += 1;
     }
 }
@@ -833,13 +877,19 @@ fn describe_tool_call(tool_name: &str, args: &Value) -> String {
         }
         "run_shell_command" => describe_shell_tool(args),
         "run_tests" => describe_wrapper_tool("run_tests", args, wrapper_command("run_tests", args)),
-        "build_project" => {
-            describe_wrapper_tool("build_project", args, wrapper_command("build_project", args))
+        "build_project" => describe_wrapper_tool(
+            "build_project",
+            args,
+            wrapper_command("build_project", args),
+        ),
+        "run_linter" => {
+            describe_wrapper_tool("run_linter", args, wrapper_command("run_linter", args))
         }
-        "run_linter" => describe_wrapper_tool("run_linter", args, wrapper_command("run_linter", args)),
-        "run_formatter" => {
-            describe_wrapper_tool("run_formatter", args, wrapper_command("run_formatter", args))
-        }
+        "run_formatter" => describe_wrapper_tool(
+            "run_formatter",
+            args,
+            wrapper_command("run_formatter", args),
+        ),
         "apply_patch" => describe_apply_patch(args),
         "git_status" => "git_status".to_string(),
         "git_diff" => {
@@ -857,7 +907,10 @@ fn describe_shell_tool(args: &Value) -> String {
     let cwd = string_arg(args, "working_directory").unwrap_or(".");
     match args.get("timeout_seconds").and_then(Value::as_u64) {
         Some(timeout) => {
-            format!("run_shell_command command={command:?} cwd={cwd:?} timeout={}s", timeout)
+            format!(
+                "run_shell_command command={command:?} cwd={cwd:?} timeout={}s",
+                timeout
+            )
         }
         None => format!("run_shell_command command={command:?} cwd={cwd:?}"),
     }
@@ -955,7 +1008,10 @@ fn update_verification_state(
         return;
     }
 
-    let blocked = result.get("blocked").and_then(Value::as_bool).unwrap_or(false);
+    let blocked = result
+        .get("blocked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let timed_out = result
         .get("timed_out")
         .and_then(Value::as_bool)
@@ -1000,7 +1056,9 @@ fn is_verification_tool(tool_name: &str, args: &Value) -> bool {
     match tool_name {
         "run_tests" | "build_project" => true,
         "run_shell_command" => {
-            let command = string_arg(args, "command").unwrap_or_default().to_ascii_lowercase();
+            let command = string_arg(args, "command")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
             command.contains("cargo test")
                 || command.contains("swift test")
                 || command.contains("cargo build")
@@ -1019,9 +1077,23 @@ fn verification_tool_name(tool_name: &str, args: &Value) -> String {
     }
 }
 
-fn emit_tool_result_preview(tool_name: &str, result: &Value) {
+fn emit_tool_result_preview(
+    output: &dyn OutputSink,
+    tool_name: &str,
+    result: &Value,
+    verbose_tools: bool,
+) {
     if let Some(preview) = render_tool_result_preview(tool_name, result) {
-        eprintln!("{preview}");
+        let mut lines = preview.lines();
+        if let Some(summary) = lines.next() {
+            output.stderr_line(&format!("tool< {summary}"));
+        }
+        if verbose_tools {
+            let detail = lines.collect::<Vec<_>>().join("\n");
+            if !detail.is_empty() {
+                output.stderr_line(&detail);
+            }
+        }
     }
 }
 
@@ -1035,19 +1107,25 @@ fn render_tool_result_preview(tool_name: &str, result: &Value) -> Option<String>
         _ if is_command_like_result(result) => Some(render_command_like_result(tool_name, result)),
         _ => serde_json::to_string_pretty(result)
             .ok()
-            .map(|body| format!("tool result: {tool_name}\n{body}")),
+            .map(|body| format!("{tool_name}\n{body}")),
     }
 }
 
 fn render_read_file_result(result: &Value) -> Option<String> {
     let path = result.get("path").and_then(Value::as_str)?;
-    let content = result.get("content").and_then(Value::as_str).unwrap_or_default();
+    let content = result
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let was_truncated = result
         .get("was_truncated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let preview = truncate_preview_text(content);
-    let mut out = format!("tool result: read_file path={path:?} truncated={was_truncated}");
+    let mut out = format!("read_file path={path:?}");
+    if was_truncated {
+        out.push_str(" truncated");
+    }
     if preview.is_empty() {
         return Some(out);
     }
@@ -1070,11 +1148,15 @@ fn render_list_directory_result(result: &Value) -> Option<String> {
         }
     }
     let preview = truncate_preview_text(&body);
-    Some(format!(
-        "tool result: list_directory path={path:?} entries={} truncated={was_truncated}\n{}",
-        entries.len(),
-        preview
-    ))
+    let mut out = format!("list_directory path={path:?} entries={}", entries.len());
+    if was_truncated {
+        out.push_str(" truncated");
+    }
+    if !preview.is_empty() {
+        out.push('\n');
+        out.push_str(&preview);
+    }
+    Some(out)
 }
 
 fn render_command_like_result(tool_name: &str, result: &Value) -> String {
@@ -1103,58 +1185,87 @@ fn render_command_like_result(tool_name: &str, result: &Value) -> String {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty());
 
-    let mut out = format!("tool result: {tool_name}");
+    let status = if approval_required {
+        "approval-required".to_string()
+    } else if blocked {
+        "blocked".to_string()
+    } else if timed_out {
+        "timed-out".to_string()
+    } else if let Some(code) = exit_code {
+        if code == 0 {
+            "ok".to_string()
+        } else {
+            format!("failed exit={code}")
+        }
+    } else {
+        "done".to_string()
+    };
+
+    let mut out = format!("{tool_name} {status}");
     if let Some(command) = command {
         let _ = write!(&mut out, " command={command:?}");
     }
     if let Some(cwd) = cwd {
         let _ = write!(&mut out, " cwd={cwd:?}");
     }
-    if let Some(exit_code) = exit_code {
-        let _ = write!(&mut out, " exit_code={exit_code}");
-    }
     if let Some(duration_ms) = duration_ms {
         let _ = write!(&mut out, " duration={}ms", duration_ms);
     }
-    let _ = write!(
-        &mut out,
-        " timed_out={} blocked={} approval_required={} truncated={}",
-        timed_out, blocked, approval_required, was_truncated
-    );
+    if was_truncated {
+        out.push_str(" truncated");
+    }
     if let Some(reason) = decision_reason {
         let _ = write!(&mut out, " reason={reason:?}");
     }
 
-    let stdout = result.get("stdout").and_then(Value::as_str).unwrap_or_default();
-    let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or_default();
+    let stdout = result
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let stderr = result
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if !stdout.is_empty() {
-        out.push_str("\nstdout:\n");
+        out.push_str("\nstdout\n");
         out.push_str(&truncate_preview_text(stdout));
     }
     if !stderr.is_empty() {
-        out.push_str("\nstderr:\n");
+        out.push_str("\nstderr\n");
         out.push_str(&truncate_preview_text(stderr));
     }
     out
 }
 
 fn render_apply_patch_result(result: &Value) -> String {
-    let valid = result.get("valid").and_then(Value::as_bool).unwrap_or(false);
-    let applied = result.get("applied").and_then(Value::as_bool).unwrap_or(false);
+    let valid = result
+        .get("valid")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let applied = result
+        .get("applied")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let approval_required = result
         .get("approval_required")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let mut out = format!(
-        "tool result: apply_patch valid={} applied={} approval_required={}",
-        valid, applied, approval_required
-    );
+    let status = if approval_required {
+        "approval-required"
+    } else if !valid {
+        "invalid"
+    } else if applied {
+        "applied"
+    } else {
+        "checked"
+    };
+    let mut out = format!("apply_patch {status}");
     let check_stderr = result
         .get("check_stderr")
         .and_then(Value::as_str)
         .unwrap_or_default();
     if !check_stderr.is_empty() {
-        out.push_str("\ncheck_stderr:\n");
+        out.push_str("\ncheck\n");
         out.push_str(&truncate_preview_text(check_stderr));
     }
     let apply_stderr = result
@@ -1162,7 +1273,7 @@ fn render_apply_patch_result(result: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default();
     if !apply_stderr.is_empty() {
-        out.push_str("\napply_stderr:\n");
+        out.push_str("\napply\n");
         out.push_str(&truncate_preview_text(apply_stderr));
     }
     out
@@ -1178,13 +1289,23 @@ fn render_checkpoint_result(result: &Value) -> String {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let path = result.get("path").and_then(Value::as_str).unwrap_or("");
-    let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or_default();
-    let mut out = format!(
-        "tool result: checkpoint_repo created={} approval_required={} path={path:?}",
-        created, approval_required
-    );
+    let stderr = result
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let status = if approval_required {
+        "approval-required"
+    } else if created {
+        "created"
+    } else {
+        "skipped"
+    };
+    let mut out = format!("checkpoint_repo {status}");
+    if !path.is_empty() {
+        let _ = write!(&mut out, " path={path:?}");
+    }
     if !stderr.is_empty() {
-        out.push_str("\nstderr:\n");
+        out.push_str("\nstderr\n");
         out.push_str(&truncate_preview_text(stderr));
     }
     out
@@ -1203,16 +1324,18 @@ fn render_undo_result(result: &Value) -> String {
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let status = if approval_required {
+        "approval-required"
+    } else if undone {
+        "undone"
+    } else {
+        "skipped"
+    };
     if message.is_empty() {
-        format!(
-            "tool result: undo_last_patch undone={} approval_required={}",
-            undone, approval_required
-        )
+        format!("undo_last_patch {status}")
     } else {
         format!(
-            "tool result: undo_last_patch undone={} approval_required={}\n{}",
-            undone,
-            approval_required,
+            "undo_last_patch {status}\n{}",
             truncate_preview_text(message)
         )
     }
@@ -1264,19 +1387,14 @@ fn emit_tool_notice(
     result: &Value,
     verbose_tools: bool,
 ) -> Result<()> {
+    let _ = verbose_tools;
     match tool_name {
         "checkpoint_repo" => {
             let created = result
                 .get("created")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let path = result
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if verbose_tools && created {
-                eprintln!("checkpoint created: {path}");
-            }
+            let path = result.get("path").and_then(Value::as_str).unwrap_or("");
             session.append(
                 "tool_notice",
                 json!({
@@ -1291,15 +1409,7 @@ fn emit_tool_notice(
                 .get("undone")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let message = result
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if verbose_tools && !message.is_empty() {
-                eprintln!("{message}");
-            } else if verbose_tools && undone {
-                eprintln!("undo completed");
-            }
+            let message = result.get("message").and_then(Value::as_str).unwrap_or("");
             session.append(
                 "tool_notice",
                 json!({
@@ -1323,7 +1433,10 @@ fn approval_cache_key(tool_name: &str, args: &Value, reason: Option<&str>) -> Op
     if tool_name != "run_shell_command" {
         return None;
     }
-    let command = args.get("command").and_then(Value::as_str).unwrap_or_default();
+    let command = args
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let lower = command.to_ascii_lowercase();
     let tier1_patterns = [
         "cargo test",
@@ -1358,7 +1471,10 @@ fn maybe_record_applied_patch(
     if !applied {
         return Ok(());
     }
-    let patch = args.get("patch").and_then(Value::as_str).unwrap_or_default();
+    let patch = args
+        .get("patch")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if patch.trim().is_empty() {
         return Ok(());
     }
@@ -1367,11 +1483,15 @@ fn maybe_record_applied_patch(
     Ok(())
 }
 
-fn emit_max_steps_notice(session: &SessionStore, max_steps: u32) -> Result<()> {
+fn emit_max_steps_notice(
+    session: &SessionStore,
+    max_steps: u32,
+    output: &dyn OutputSink,
+) -> Result<()> {
     let message = format!(
         "max_steps ({max_steps}) reached before the task completed; increase the step limit or use a workflow preset."
     );
-    eprintln!("{message}");
+    output.stderr_line(&message);
     session.append(
         "runtime_notice",
         json!({
@@ -1386,6 +1506,7 @@ fn emit_max_steps_notice(session: &SessionStore, max_steps: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn describe_run_shell_command_includes_command_and_cwd() {
@@ -1427,7 +1548,79 @@ diff --git a/Tests/AppTests/File.swift b/Tests/AppTests/File.swift
             description.contains("Tests/AppTests/File.swift"),
             "description should include patched file"
         );
-        assert!(description.contains("lines="), "description should include line count");
+        assert!(
+            description.contains("lines="),
+            "description should include line count"
+        );
+    }
+
+    #[test]
+    fn render_command_like_result_uses_compact_status() {
+        let rendered = render_command_like_result(
+            "build_project",
+            &json!({
+                "command": "swift build",
+                "working_directory": ".",
+                "exit_code": 1,
+                "duration_ms": 312,
+                "timed_out": false,
+                "blocked": false,
+                "approval_required": false,
+                "was_truncated": false,
+                "stdout": "",
+                "stderr": "compile failed"
+            }),
+        );
+
+        assert!(rendered.starts_with("build_project failed exit=1"));
+        assert!(!rendered.contains("timed_out=false"));
+        assert!(!rendered.contains("approval_required=false"));
+        assert!(rendered.contains("\nstderr\ncompile failed"));
+    }
+
+    #[test]
+    fn render_apply_patch_result_uses_status_words() {
+        let rendered = render_apply_patch_result(&json!({
+            "valid": false,
+            "applied": false,
+            "approval_required": false,
+            "check_stderr": "corrupt patch",
+            "apply_stderr": ""
+        }));
+
+        assert!(rendered.starts_with("apply_patch invalid"));
+        assert!(!rendered.contains("valid=false"));
+        assert!(rendered.contains("\ncheck\ncorrupt patch"));
+    }
+
+    #[test]
+    fn compact_result_preview_keeps_summary_on_first_line() {
+        let rendered = render_command_like_result(
+            "build_project",
+            &json!({
+                "command": "swift build",
+                "working_directory": ".",
+                "exit_code": 1,
+                "duration_ms": 312,
+                "timed_out": false,
+                "blocked": false,
+                "approval_required": false,
+                "was_truncated": false,
+                "stdout": "a",
+                "stderr": "b"
+            }),
+        );
+
+        let mut lines = rendered.lines();
+        let summary = lines.next().expect("summary line");
+        let detail = lines.collect::<Vec<_>>().join("\n");
+
+        assert_eq!(
+            summary,
+            "build_project failed exit=1 command=\"swift build\" cwd=\".\" duration=312ms"
+        );
+        assert!(detail.contains("stdout"));
+        assert!(detail.contains("stderr"));
     }
 
     #[test]

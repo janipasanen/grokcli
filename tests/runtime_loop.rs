@@ -1,13 +1,13 @@
+use anyhow::{Result, bail};
+use async_trait::async_trait;
 use grokcli::agent::runtime::AgentRuntime;
 use grokcli::config::config::AppConfig;
 use grokcli::provider::LanguageModelProvider;
 use grokcli::provider::models::ResponsesRequest;
+use grokcli::tools::checkpoint_repo::CheckpointRepoResult;
 use grokcli::tools::registry::ToolRegistry;
 use grokcli::tools::run_shell_command::RunShellCommandResult;
-use grokcli::tools::checkpoint_repo::CheckpointRepoResult;
 use grokcli::tools::undo_last_patch::UndoLastPatchResult;
-use anyhow::{Result, bail};
-use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -142,7 +142,10 @@ async fn runtime_executes_tool_and_returns_result_in_next_request() -> Result<()
         .get("content")
         .and_then(Value::as_str)
         .unwrap_or("");
-    assert!(content.contains("alpha.txt"), "expected tool output to include alpha.txt");
+    assert!(
+        content.contains("alpha.txt"),
+        "expected tool output to include alpha.txt"
+    );
 
     Ok(())
 }
@@ -195,7 +198,10 @@ async fn runtime_streaming_responses_executes_tool() -> Result<()> {
     let requests = provider.recorded_requests();
     assert!(requests.len() >= 2, "expected at least two provider calls");
     let first = &requests[0];
-    assert!(first.get("input").is_some(), "responses request should include input");
+    assert!(
+        first.get("input").is_some(),
+        "responses request should include input"
+    );
     assert_eq!(first.get("store").and_then(Value::as_bool), Some(true));
     assert_eq!(first.get("stream").and_then(Value::as_bool), Some(true));
     Ok(())
@@ -261,7 +267,10 @@ async fn runtime_omits_instructions_on_responses_continuation() -> Result<()> {
         "initial responses request should include instructions"
     );
     assert!(
-        second.get("previous_response_id").and_then(Value::as_str).is_some(),
+        second
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+            .is_some(),
         "continuation request should include previous_response_id"
     );
     assert!(
@@ -287,8 +296,7 @@ fn tool_registry_run_tests_and_build_project() -> Result<()> {
         name: "run_tests".to_string(),
         arguments: json!({ "language": "rust", "approved": true }),
     })?;
-    let run_tests_result: RunShellCommandResult =
-        serde_json::from_value(run_tests.result.clone())?;
+    let run_tests_result: RunShellCommandResult = serde_json::from_value(run_tests.result.clone())?;
     assert!(run_tests_result.exit_code.is_some());
 
     let build_project = registry.execute(grokcli::tools::registry::ToolCallRequest {
