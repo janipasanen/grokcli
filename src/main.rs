@@ -54,6 +54,12 @@ struct Cli {
     preset: Option<WorkflowPreset>,
     #[arg(long, default_value_t = 8, help_heading = "Runtime", help = "Maximum agent loop steps.")]
     max_steps: u32,
+    #[arg(
+        long,
+        help_heading = "Runtime",
+        help = "Override context budget in bytes for tool outputs."
+    )]
+    context_budget_bytes: Option<usize>,
     #[arg(long, help_heading = "Help", help = "Show extended help sections and exit.")]
     show_help_sections: bool,
     #[arg(help = "User task prompt.")]
@@ -92,6 +98,9 @@ async fn main() -> Result<()> {
             ApiModeOpt::Responses => "responses".to_string(),
             ApiModeOpt::ChatCompletions => "chat_completions".to_string(),
         };
+    }
+    if let Some(bytes) = cli.context_budget_bytes {
+        cfg.context_budget_bytes = bytes;
     }
 
     let selected_mode = cli.mode.unwrap_or(AgentMode::Agent);

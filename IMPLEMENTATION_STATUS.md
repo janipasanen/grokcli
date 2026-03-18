@@ -63,3 +63,4 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 - 2026-03-18: Extended approval cache to cover run_tests/run_linter/run_formatter/build_project tools.
 - 2026-03-18: Added integration test for streaming Responses tool-call loop with mock provider.
 - 2026-03-18: Added runtime notices for checkpoint/undo tools and persisted tool_notice events for safer UX.
+- 2026-03-18: Added CLI override for context budget (`--context-budget-bytes`) and help text.
