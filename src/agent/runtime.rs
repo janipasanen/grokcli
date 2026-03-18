@@ -225,18 +225,24 @@ impl AgentRuntime {
         let mut completed = false;
 
         for step in 0..self.max_steps {
-            let body = json!({
+            let mut body = json!({
                 "model": normalize_model_name(&self.cfg.model),
                 "input": pending_input,
-                "instructions": instructions.clone(),
                 "tools": registry.definitions_json(),
                 "stream": self.cfg.stream,
                 "parallel_tool_calls": self.cfg.parallel_tool_calls,
                 "store": store,
                 "max_output_tokens": self.cfg.max_output_tokens,
-                "temperature": self.cfg.temperature,
-                "previous_response_id": previous_response_id
+                "temperature": self.cfg.temperature
             });
+            if let Some(obj) = body.as_object_mut() {
+                if previous_response_id.is_none() {
+                    obj.insert("instructions".to_string(), json!(instructions.clone()));
+                }
+                if let Some(prev) = previous_response_id.clone() {
+                    obj.insert("previous_response_id".to_string(), json!(prev));
+                }
+            }
 
             let mut streamed = false;
             let response = if self.cfg.stream {

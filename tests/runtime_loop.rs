@@ -222,6 +222,46 @@ async fn runtime_forces_store_true_for_multi_step_responses() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn runtime_omits_instructions_on_responses_continuation() -> Result<()> {
+    let dir = tempdir()?;
+    unsafe {
+        std::env::set_var("HOME", dir.path());
+    }
+    std::env::set_current_dir(dir.path())?;
+    std::fs::write(dir.path().join("alpha.txt"), "alpha")?;
+
+    let provider = MockProvider::new(
+        vec![responses_tool_call_response(), responses_final_response()],
+        Vec::new(),
+    );
+    let mut cfg = AppConfig::default();
+    cfg.api_mode = "responses".to_string();
+    cfg.stream = false;
+    let runtime = AgentRuntime::new(cfg, 3);
+    runtime
+        .run_ask(&provider, "list files".to_string(), None)
+        .await?;
+
+    let requests = provider.recorded_requests();
+    assert!(requests.len() >= 2, "expected at least two provider calls");
+    let first = &requests[0];
+    let second = &requests[1];
+    assert!(
+        first.get("instructions").and_then(Value::as_str).is_some(),
+        "initial responses request should include instructions"
+    );
+    assert!(
+        second.get("previous_response_id").and_then(Value::as_str).is_some(),
+        "continuation request should include previous_response_id"
+    );
+    assert!(
+        second.get("instructions").is_none(),
+        "continuation request must omit instructions"
+    );
+    Ok(())
+}
+
 #[test]
 fn tool_registry_run_tests_and_build_project() -> Result<()> {
     let dir = tempdir()?;
