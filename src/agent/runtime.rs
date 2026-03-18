@@ -332,7 +332,9 @@ impl AgentRuntime {
                       "action": action
                     }),
                 )?;
-                eprintln!("tool: {action}");
+                if self.cfg.verbose_tools {
+                    eprintln!("tool: {action}");
+                }
                 let Some(result) = self.execute_with_approval(
                     registry,
                     session,
@@ -351,14 +353,21 @@ impl AgentRuntime {
                       "call_id": call.call_id
                     }),
                 )?;
-                emit_tool_notice(session, &call.name, &result.result)?;
+                emit_tool_notice(
+                    session,
+                    &call.name,
+                    &result.result,
+                    self.cfg.verbose_tools,
+                )?;
                 update_verification_state(
                     &mut verification,
                     &call.name,
                     &call.arguments,
                     &result.result,
                 );
-                emit_tool_result_preview(&call.name, &result.result);
+                if self.cfg.verbose_tools {
+                    emit_tool_result_preview(&call.name, &result.result);
+                }
                 maybe_record_applied_patch(
                     &call.name,
                     &call.arguments,
@@ -489,7 +498,9 @@ impl AgentRuntime {
                       "action": action
                     }),
                 )?;
-                eprintln!("tool: {action}");
+                if self.cfg.verbose_tools {
+                    eprintln!("tool: {action}");
+                }
                 let Some(result) = self.execute_with_approval(
                     registry,
                     session,
@@ -508,14 +519,21 @@ impl AgentRuntime {
                       "call_id": call.call_id
                     }),
                 )?;
-                emit_tool_notice(session, &call.name, &result.result)?;
+                emit_tool_notice(
+                    session,
+                    &call.name,
+                    &result.result,
+                    self.cfg.verbose_tools,
+                )?;
                 update_verification_state(
                     &mut verification,
                     &call.name,
                     &call.arguments,
                     &result.result,
                 );
-                emit_tool_result_preview(&call.name, &result.result);
+                if self.cfg.verbose_tools {
+                    emit_tool_result_preview(&call.name, &result.result);
+                }
                 maybe_record_applied_patch(
                     &call.name,
                     &call.arguments,
@@ -1240,7 +1258,12 @@ fn truncate_preview_text(text: &str) -> String {
     out
 }
 
-fn emit_tool_notice(session: &SessionStore, tool_name: &str, result: &Value) -> Result<()> {
+fn emit_tool_notice(
+    session: &SessionStore,
+    tool_name: &str,
+    result: &Value,
+    verbose_tools: bool,
+) -> Result<()> {
     match tool_name {
         "checkpoint_repo" => {
             let created = result
@@ -1251,7 +1274,7 @@ fn emit_tool_notice(session: &SessionStore, tool_name: &str, result: &Value) -> 
                 .get("path")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if created {
+            if verbose_tools && created {
                 eprintln!("checkpoint created: {path}");
             }
             session.append(
@@ -1272,9 +1295,9 @@ fn emit_tool_notice(session: &SessionStore, tool_name: &str, result: &Value) -> 
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if !message.is_empty() {
+            if verbose_tools && !message.is_empty() {
                 eprintln!("{message}");
-            } else if undone {
+            } else if verbose_tools && undone {
                 eprintln!("undo completed");
             }
             session.append(
