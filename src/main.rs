@@ -1,16 +1,9 @@
-mod agent;
-mod config;
-mod persistence;
-mod provider;
-mod tools;
-mod workflows;
-
-use crate::agent::runtime::AgentRuntime;
-use crate::config::config::AppConfig;
-use crate::persistence::patch_store::PatchStore;
-use crate::persistence::session_store::{SessionStore, latest_session_path, resolve_session_path};
-use crate::provider::xai_client::XaiClient;
-use crate::workflows::presets::{WorkflowPreset, apply_preset_prompt};
+use grokcli::agent::runtime::AgentRuntime;
+use grokcli::config::config::AppConfig;
+use grokcli::persistence::patch_store::PatchStore;
+use grokcli::persistence::session_store::{SessionStore, latest_session_path, resolve_session_path};
+use grokcli::provider::xai_client::XaiClient;
+use grokcli::workflows::presets::{WorkflowPreset, apply_preset_prompt};
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use std::env;

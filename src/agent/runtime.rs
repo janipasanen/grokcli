@@ -2,7 +2,7 @@ use crate::config::config::AppConfig;
 use crate::persistence::patch_store::PatchStore;
 use crate::persistence::session_store::SessionStore;
 use crate::provider::models::build_simple_request;
-use crate::provider::xai_client::XaiClient;
+use crate::provider::LanguageModelProvider;
 use crate::tools::registry::{ToolCallRequest, ToolCallResult, ToolRegistry};
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -22,7 +22,7 @@ impl AgentRuntime {
 
     pub async fn run_ask(
         &self,
-        client: &XaiClient,
+        client: &dyn LanguageModelProvider,
         prompt: String,
         resume_session: Option<SessionStore>,
     ) -> Result<()> {
@@ -69,11 +69,11 @@ impl AgentRuntime {
                     self.cfg.temperature,
                 );
                 let resp = if self.cfg.stream {
-                    let t = client.stream_response_to_stdout(&request).await;
+                    let t = client.stream_response_text(&request).await;
                     println!();
                     t
                 } else {
-                    client.create_response(&request).await
+                    client.create_response_text(&request).await
                 };
                 match resp {
                     Ok(t) => t,
@@ -179,7 +179,7 @@ fn normalize_model_name(model: &str) -> String {
 impl AgentRuntime {
     async fn run_responses_loop(
         &self,
-        client: &XaiClient,
+        client: &dyn LanguageModelProvider,
         session: &SessionStore,
         registry: &ToolRegistry,
         repo_root: &std::path::Path,
@@ -206,7 +206,11 @@ impl AgentRuntime {
                 "previous_response_id": previous_response_id
             });
 
-            let response = client.create_response_json(&body).await?;
+            let response = if self.cfg.stream {
+                client.create_response_stream_json(&body).await?
+            } else {
+                client.create_response_json(&body).await?
+            };
             session.append("provider_response", response.clone())?;
             previous_response_id = response
                 .get("id")
@@ -283,7 +287,7 @@ impl AgentRuntime {
 
     async fn run_chat_completions_loop(
         &self,
-        client: &XaiClient,
+        client: &dyn LanguageModelProvider,
         session: &SessionStore,
         registry: &ToolRegistry,
         repo_root: &std::path::Path,

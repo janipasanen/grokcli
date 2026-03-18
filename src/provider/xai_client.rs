@@ -1,5 +1,7 @@
 use crate::provider::models::{ResponsesRequest, ResponsesResponse};
+use crate::provider::LanguageModelProvider;
 use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -99,6 +101,83 @@ impl XaiClient {
         self.post_json("/v1/chat/completions", body).await
     }
 
+    pub async fn create_response_stream_json(&self, body: &Value) -> Result<Value> {
+        let url = format!("{}/v1/responses", self.base_url);
+        let max_attempts = 2u32;
+        for attempt in 1..=max_attempts {
+            let response = match self.client.post(&url).json(body).send().await {
+                Ok(r) => r,
+                Err(err) => {
+                    if should_retry_transport(&err) && attempt < max_attempts {
+                        sleep(backoff_delay(attempt)).await;
+                        continue;
+                    }
+                    return Err(anyhow!("xAI streaming request failed at {url}: {err}"));
+                }
+            };
+            let status = response.status();
+            if !status.is_success() {
+                let text = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "<failed to read response body>".to_string());
+                if should_retry_status(status) && attempt < max_attempts {
+                    sleep(backoff_delay(attempt)).await;
+                    continue;
+                }
+                bail!(
+                    "xAI returned {} at {}: {}",
+                    status,
+                    url,
+                    truncate_for_error(&text)
+                );
+            }
+
+            let mut stream = response.bytes_stream();
+            let mut buffer = String::new();
+            let mut final_response: Option<Value> = None;
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = chunk_result.context("failed to read streaming response chunk")?;
+                let text = String::from_utf8_lossy(&chunk);
+                buffer.push_str(&text);
+
+                while let Some(newline_pos) = buffer.find('\n') {
+                    let line: String = buffer.drain(..=newline_pos).collect();
+                    let trimmed = line.trim();
+                    if !trimmed.starts_with("data:") {
+                        continue;
+                    }
+                    let payload = trimmed.trim_start_matches("data:").trim();
+                    if payload.is_empty() || payload == "[DONE]" {
+                        continue;
+                    }
+                    if let Ok(value) = serde_json::from_str::<Value>(payload) {
+                        if value.get("type").and_then(Value::as_str)
+                            == Some("response.output_text.delta")
+                        {
+                            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                                print!("{delta}");
+                            }
+                        }
+                        if let Some(resp) = value.get("response") {
+                            final_response = Some(resp.clone());
+                        } else if value.get("output").is_some() && value.get("id").is_some() {
+                            final_response = Some(value.clone());
+                        }
+                    }
+                }
+            }
+            println!();
+            if let Some(value) = final_response {
+                return Ok(value);
+            }
+            return Err(anyhow!(
+                "xAI streaming response completed without final response payload"
+            ));
+        }
+        Err(anyhow!("xAI streaming response failed after retries"))
+    }
+
     pub async fn stream_response_to_stdout(&self, request: &ResponsesRequest) -> Result<String> {
         let url = format!("{}/v1/responses", self.base_url);
         let response = self
@@ -143,6 +222,29 @@ impl XaiClient {
         }
 
         Ok(collected)
+    }
+}
+
+#[async_trait]
+impl LanguageModelProvider for XaiClient {
+    async fn create_response_text(&self, request: &ResponsesRequest) -> Result<String> {
+        self.create_response(request).await
+    }
+
+    async fn stream_response_text(&self, request: &ResponsesRequest) -> Result<String> {
+        self.stream_response_to_stdout(request).await
+    }
+
+    async fn create_response_json(&self, body: &Value) -> Result<Value> {
+        self.create_response_json(body).await
+    }
+
+    async fn create_response_stream_json(&self, body: &Value) -> Result<Value> {
+        self.create_response_stream_json(body).await
+    }
+
+    async fn create_chat_completion_json(&self, body: &Value) -> Result<Value> {
+        self.create_chat_completion_json(body).await
     }
 }
 

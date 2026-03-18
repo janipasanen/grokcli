@@ -28,6 +28,8 @@ pub struct AppConfig {
     pub api_mode: String,
     #[serde(default = "default_auto_approve")]
     pub auto_approve: bool,
+    #[serde(default = "default_context_budget_bytes")]
+    pub context_budget_bytes: usize,
 }
 
 impl Default for AppConfig {
@@ -44,6 +46,7 @@ impl Default for AppConfig {
             timeout_seconds: default_timeout_seconds(),
             api_mode: default_api_mode(),
             auto_approve: default_auto_approve(),
+            context_budget_bytes: default_context_budget_bytes(),
         }
     }
 }
@@ -117,4 +120,8 @@ fn default_api_mode() -> String {
 
 fn default_auto_approve() -> bool {
     false
+}
+
+fn default_context_budget_bytes() -> usize {
+    256 * 1024
 }
