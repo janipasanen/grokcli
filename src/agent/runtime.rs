@@ -666,6 +666,11 @@ fn render_patch_preview(patch: &str) {
 }
 
 fn approval_cache_key(tool_name: &str, args: &Value, reason: Option<&str>) -> Option<String> {
+    let tier1_tools = ["run_tests", "run_linter", "run_formatter", "build_project"];
+    if tier1_tools.iter().any(|t| *t == tool_name) {
+        let reason_key = reason.unwrap_or("tier1");
+        return Some(format!("{}::{}", tool_name, reason_key));
+    }
     if tool_name != "run_shell_command" {
         return None;
     }

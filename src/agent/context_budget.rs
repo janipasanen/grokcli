@@ -43,3 +43,17 @@ impl ContextBudgetManager {
         self.max_bytes
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ContextBudgetManager;
+    use serde_json::json;
+
+    #[test]
+    fn budget_truncates_large_output() {
+        let mut budget = ContextBudgetManager::new(32);
+        let payload = json!({ "data": "x".repeat(200) });
+        let out = budget.fit_tool_output(payload);
+        assert!(out.get("budget_truncated").and_then(|v| v.as_bool()).unwrap_or(false));
+    }
+}
