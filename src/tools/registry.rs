@@ -1,10 +1,16 @@
 use crate::tools::apply_patch::{ApplyPatchArgs, run as run_apply_patch};
+use crate::tools::build_project::{BuildProjectArgs, run_tool as run_build_project};
+use crate::tools::checkpoint_repo::{CheckpointRepoArgs, run as run_checkpoint_repo};
 use crate::tools::git_diff::{GitDiffArgs, run as run_git_diff};
 use crate::tools::git_status::run as run_git_status;
 use crate::tools::list_directory::{ListDirectoryArgs, run as run_list_directory};
 use crate::tools::read_file::{ReadFileArgs, run as run_read_file};
+use crate::tools::run_formatter::{RunFormatterArgs, run_tool as run_formatter};
+use crate::tools::run_linter::{RunLinterArgs, run_tool as run_linter};
 use crate::tools::run_shell_command::{RunShellCommandArgs, run as run_shell_command};
+use crate::tools::run_tests::{RunTestsArgs, run_tool as run_tests};
 use crate::tools::search_text::{SearchTextArgs, run as run_search_text};
+use crate::tools::undo_last_patch::{UndoLastPatchArgs, run as run_undo_last_patch};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -60,6 +66,36 @@ impl ToolRegistry {
                 let args: ApplyPatchArgs = serde_json::from_value(call.arguments)
                     .context("invalid apply_patch arguments")?;
                 serde_json::to_value(run_apply_patch(&self.repo_root, args)?)?
+            }
+            "build_project" => {
+                let args: BuildProjectArgs = serde_json::from_value(call.arguments)
+                    .context("invalid build_project arguments")?;
+                serde_json::to_value(run_build_project(&self.repo_root, args)?)?
+            }
+            "run_tests" => {
+                let args: RunTestsArgs = serde_json::from_value(call.arguments)
+                    .context("invalid run_tests arguments")?;
+                serde_json::to_value(run_tests(&self.repo_root, args)?)?
+            }
+            "run_linter" => {
+                let args: RunLinterArgs = serde_json::from_value(call.arguments)
+                    .context("invalid run_linter arguments")?;
+                serde_json::to_value(run_linter(&self.repo_root, args)?)?
+            }
+            "run_formatter" => {
+                let args: RunFormatterArgs = serde_json::from_value(call.arguments)
+                    .context("invalid run_formatter arguments")?;
+                serde_json::to_value(run_formatter(&self.repo_root, args)?)?
+            }
+            "checkpoint_repo" => {
+                let args: CheckpointRepoArgs = serde_json::from_value(call.arguments)
+                    .context("invalid checkpoint_repo arguments")?;
+                serde_json::to_value(run_checkpoint_repo(&self.repo_root, args)?)?
+            }
+            "undo_last_patch" => {
+                let args: UndoLastPatchArgs = serde_json::from_value(call.arguments)
+                    .context("invalid undo_last_patch arguments")?;
+                serde_json::to_value(run_undo_last_patch(&self.repo_root, args)?)?
             }
             "git_status" => serde_json::to_value(run_git_status(&self.repo_root)?)?,
             "git_diff" => {
@@ -165,6 +201,77 @@ impl ToolRegistry {
                 "approved": { "type": "boolean" }
               },
               "required": ["patch"]
+            }
+          }
+          ,
+          {
+            "type": "function",
+            "name": "build_project",
+            "description": "Run the project build for a given language (rust|swift).",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "language": { "type": "string" },
+                "approved": { "type": "boolean" }
+              }
+            }
+          },
+          {
+            "type": "function",
+            "name": "run_tests",
+            "description": "Run project tests for a given language (rust|swift).",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "language": { "type": "string" },
+                "approved": { "type": "boolean" }
+              }
+            }
+          },
+          {
+            "type": "function",
+            "name": "run_linter",
+            "description": "Run linter for a given language (rust|swift).",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "language": { "type": "string" },
+                "approved": { "type": "boolean" }
+              }
+            }
+          },
+          {
+            "type": "function",
+            "name": "run_formatter",
+            "description": "Run formatter for a given language (rust|swift).",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "language": { "type": "string" },
+                "approved": { "type": "boolean" }
+              }
+            }
+          },
+          {
+            "type": "function",
+            "name": "checkpoint_repo",
+            "description": "Create a patch checkpoint of the current repo diff.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "approved": { "type": "boolean" }
+              }
+            }
+          },
+          {
+            "type": "function",
+            "name": "undo_last_patch",
+            "description": "Undo the most recently recorded patch for this repo.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "approved": { "type": "boolean" }
+              }
             }
           }
         ])

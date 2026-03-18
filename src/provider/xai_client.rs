@@ -40,14 +40,16 @@ impl XaiClient {
                     }
 
                     let snippet = truncate_for_error(&body_text);
-                    bail!("xAI returned {status} at {url}: {snippet}");
+                    let class = classify_status(status);
+                    bail!("xAI returned {status} ({class}) at {url}: {snippet}");
                 }
                 Err(err) => {
                     if should_retry_transport(&err) && attempt < max_attempts {
                         sleep(backoff_delay(attempt)).await;
                         continue;
                     }
-                    return Err(anyhow!("xAI request failed at {url}: {err}"));
+                    let class = classify_transport(&err);
+                    return Err(anyhow!("xAI request failed ({class}) at {url}: {err}"));
                 }
             }
         }
@@ -112,7 +114,8 @@ impl XaiClient {
                         sleep(backoff_delay(attempt)).await;
                         continue;
                     }
-                    return Err(anyhow!("xAI streaming request failed at {url}: {err}"));
+                    let class = classify_transport(&err);
+                    return Err(anyhow!("xAI streaming request failed ({class}) at {url}: {err}"));
                 }
             };
             let status = response.status();
@@ -126,8 +129,9 @@ impl XaiClient {
                     continue;
                 }
                 bail!(
-                    "xAI returned {} at {}: {}",
+                    "xAI returned {} ({}) at {}: {}",
                     status,
+                    classify_status(status),
                     url,
                     truncate_for_error(&text)
                 );
@@ -285,6 +289,32 @@ fn should_retry_status(status: StatusCode) -> bool {
 
 fn should_retry_transport(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect() || err.is_request()
+}
+
+fn classify_status(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "auth",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit",
+        StatusCode::BAD_REQUEST => "bad_request",
+        StatusCode::NOT_FOUND => "not_found",
+        StatusCode::INTERNAL_SERVER_ERROR
+        | StatusCode::BAD_GATEWAY
+        | StatusCode::SERVICE_UNAVAILABLE
+        | StatusCode::GATEWAY_TIMEOUT => "server",
+        _ => "http_error",
+    }
+}
+
+fn classify_transport(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        "connect"
+    } else if err.is_request() {
+        "request"
+    } else {
+        "transport"
+    }
 }
 
 fn backoff_delay(attempt: u32) -> Duration {

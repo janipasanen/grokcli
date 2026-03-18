@@ -55,3 +55,7 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 - 2026-03-18: Added clearer startup text response header (mode/model/api/limits/session info).
 - 2026-03-18: Added provider trait abstraction and first integration test harness with mock provider for tool-calling loop.
 - 2026-03-18: Implemented streaming Responses loop handling that returns immediately on tool-call events and continues streaming text deltas.
+- 2026-03-18: Added streaming fallback to non-streaming on failures and richer error classification in xAI logs.
+- 2026-03-18: Added patch preview output before approval for apply_patch tool calls.
+- 2026-03-18: Implemented context budget manager and applied it to tool outputs.
+- 2026-03-18: Added first-class tools for tests/build/lint/format, checkpoint, and undo, wiring them into registry and tool definitions.

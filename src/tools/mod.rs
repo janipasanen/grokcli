@@ -1,8 +1,14 @@
 pub mod apply_patch;
+pub mod build_project;
+pub mod checkpoint_repo;
 pub mod git_diff;
 pub mod git_status;
 pub mod list_directory;
 pub mod read_file;
 pub mod registry;
+pub mod run_formatter;
+pub mod run_linter;
 pub mod run_shell_command;
+pub mod run_tests;
 pub mod search_text;
+pub mod undo_last_patch;

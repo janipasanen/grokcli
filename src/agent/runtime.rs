@@ -1,3 +1,4 @@
+use crate::agent::context_budget::ContextBudgetManager;
 use crate::config::config::AppConfig;
 use crate::persistence::patch_store::PatchStore;
 use crate::persistence::session_store::SessionStore;
@@ -188,6 +189,7 @@ impl AgentRuntime {
         prompt: String,
     ) -> Result<()> {
         let mut previous_response_id = resumed_previous_response_id;
+        let mut budget = ContextBudgetManager::new(self.cfg.context_budget_bytes);
         let mut pending_input = vec![json!({
             "role": "user",
             "content": [{ "type": "input_text", "text": prompt }]
@@ -207,7 +209,16 @@ impl AgentRuntime {
             });
 
             let response = if self.cfg.stream {
-                client.create_response_stream_json(&body).await?
+                match client.create_response_stream_json(&body).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        eprintln!(
+                            "streaming failed, falling back to non-streaming: {}",
+                            err
+                        );
+                        client.create_response_json(&body).await?
+                    }
+                }
             } else {
                 client.create_response_json(&body).await?
             };
@@ -268,10 +279,11 @@ impl AgentRuntime {
                     session.path(),
                 )?;
                 eprintln!("tool: {}", call.name);
+                let budgeted = budget.fit_tool_output(result.result.clone());
                 outputs.push(json!({
                     "type": "function_call_output",
                     "call_id": call.call_id,
-                    "output": serde_json::to_string(&result.result)?
+                    "output": serde_json::to_string(&budgeted)?
                 }));
             }
 
@@ -298,6 +310,7 @@ impl AgentRuntime {
             "role": "user",
             "content": prompt
         })];
+        let mut budget = ContextBudgetManager::new(self.cfg.context_budget_bytes);
 
         for step in 0..self.max_steps {
             let body = json!({
@@ -385,10 +398,11 @@ impl AgentRuntime {
                     session.path(),
                 )?;
                 eprintln!("tool: {}", call.name);
+                let budgeted = budget.fit_tool_output(result.result.clone());
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": call.call_id,
-                    "content": serde_json::to_string(&result.result)?
+                    "content": serde_json::to_string(&budgeted)?
                 }));
             }
         }
@@ -413,6 +427,11 @@ impl AgentRuntime {
         }
 
         let reason = approval_reason(&first.result);
+        if name == "apply_patch" {
+            if let Some(patch) = args.get("patch").and_then(Value::as_str) {
+                render_patch_preview(patch);
+            }
+        }
         let cache_key = approval_cache_key(name, args, reason.as_deref());
         if let Some(key) = cache_key.as_ref() {
             if approval_cache.contains(key) {
@@ -630,6 +649,20 @@ fn prompt_user_approval(tool_name: &str, reason: Option<&str>) -> Result<bool> {
     }
     let normalized = line.trim().to_ascii_lowercase();
     Ok(normalized == "y" || normalized == "yes")
+}
+
+fn render_patch_preview(patch: &str) {
+    const MAX_LINES: usize = 200;
+    eprintln!("patch preview:");
+    let mut count = 0usize;
+    for line in patch.lines() {
+        if count >= MAX_LINES {
+            eprintln!("...[patch preview truncated]...");
+            break;
+        }
+        eprintln!("{line}");
+        count += 1;
+    }
 }
 
 fn approval_cache_key(tool_name: &str, args: &Value, reason: Option<&str>) -> Option<String> {
