@@ -24,6 +24,8 @@ pub struct AppConfig {
     pub store: bool,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
+    #[serde(default = "default_api_mode")]
+    pub api_mode: String,
 }
 
 impl Default for AppConfig {
@@ -38,6 +40,7 @@ impl Default for AppConfig {
             parallel_tool_calls: default_parallel_tool_calls(),
             store: default_store(),
             timeout_seconds: default_timeout_seconds(),
+            api_mode: default_api_mode(),
         }
     }
 }
@@ -103,4 +106,8 @@ fn default_store() -> bool {
 
 fn default_timeout_seconds() -> u64 {
     60
+}
+
+fn default_api_mode() -> String {
+    "responses".to_string()
 }

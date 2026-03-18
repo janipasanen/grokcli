@@ -11,6 +11,25 @@ pub struct XaiClient {
 }
 
 impl XaiClient {
+    async fn post_json(&self, path: &str, body: &Value) -> Result<Value> {
+        let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
+        let response = self
+            .client
+            .post(url)
+            .json(body)
+            .send()
+            .await
+            .context("xAI request failed")?;
+        let response = response
+            .error_for_status()
+            .context("xAI returned error status")?;
+        let value = response
+            .json::<Value>()
+            .await
+            .context("failed to parse xAI response JSON")?;
+        Ok(value)
+    }
+
     pub fn new(api_key: &str, base_url: &str, timeout_seconds: u64) -> Result<Self> {
         let mut headers = HeaderMap::new();
         let bearer = format!("Bearer {api_key}");
@@ -47,6 +66,14 @@ impl XaiClient {
             .await
             .context("failed to parse xAI response JSON")?;
         Ok(extract_text_from_response(&parsed))
+    }
+
+    pub async fn create_response_json(&self, body: &Value) -> Result<Value> {
+        self.post_json("/v1/responses", body).await
+    }
+
+    pub async fn create_chat_completion_json(&self, body: &Value) -> Result<Value> {
+        self.post_json("/v1/chat/completions", body).await
     }
 
     pub async fn stream_response_to_stdout(&self, request: &ResponsesRequest) -> Result<String> {
