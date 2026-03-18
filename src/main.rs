@@ -23,6 +23,8 @@ struct Cli {
     model: Option<String>,
     #[arg(long)]
     no_stream: bool,
+    #[arg(long)]
+    auto_approve: bool,
     #[arg(long, value_enum)]
     preset: Option<WorkflowPreset>,
     #[arg(long, default_value_t = 8)]
@@ -39,6 +41,9 @@ async fn main() -> Result<()> {
     }
     if cli.no_stream {
         cfg.stream = false;
+    }
+    if cli.auto_approve {
+        cfg.auto_approve = true;
     }
 
     let api_key = cfg.api_key()?;

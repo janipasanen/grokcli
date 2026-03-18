@@ -1,9 +1,11 @@
 use crate::provider::models::{ResponsesRequest, ResponsesResponse};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
+use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;
 use std::time::Duration;
+use tokio::time::sleep;
 
 pub struct XaiClient {
     client: reqwest::Client,
@@ -13,21 +15,42 @@ pub struct XaiClient {
 impl XaiClient {
     async fn post_json(&self, path: &str, body: &Value) -> Result<Value> {
         let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
-        let response = self
-            .client
-            .post(url)
-            .json(body)
-            .send()
-            .await
-            .context("xAI request failed")?;
-        let response = response
-            .error_for_status()
-            .context("xAI returned error status")?;
-        let value = response
-            .json::<Value>()
-            .await
-            .context("failed to parse xAI response JSON")?;
-        Ok(value)
+        let max_attempts = 3u32;
+
+        for attempt in 1..=max_attempts {
+            let send_result = self.client.post(&url).json(body).send().await;
+            match send_result {
+                Ok(response) => {
+                    let status = response.status();
+                    let body_text = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "<failed to read response body>".to_string());
+                    if status.is_success() {
+                        let value: Value = serde_json::from_str(&body_text)
+                            .context("failed to parse xAI response JSON")?;
+                        return Ok(value);
+                    }
+
+                    if should_retry_status(status) && attempt < max_attempts {
+                        sleep(backoff_delay(attempt)).await;
+                        continue;
+                    }
+
+                    let snippet = truncate_for_error(&body_text);
+                    bail!("xAI returned {status} at {url}: {snippet}");
+                }
+                Err(err) => {
+                    if should_retry_transport(&err) && attempt < max_attempts {
+                        sleep(backoff_delay(attempt)).await;
+                        continue;
+                    }
+                    return Err(anyhow!("xAI request failed at {url}: {err}"));
+                }
+            }
+        }
+
+        Err(anyhow!("xAI request failed after retries at {url}"))
     }
 
     pub fn new(api_key: &str, base_url: &str, timeout_seconds: u64) -> Result<Self> {
@@ -120,6 +143,40 @@ impl XaiClient {
         }
 
         Ok(collected)
+    }
+}
+
+fn should_retry_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn should_retry_transport(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_request()
+}
+
+fn backoff_delay(attempt: u32) -> Duration {
+    let base_ms = 250u64.saturating_mul(2u64.saturating_pow(attempt - 1));
+    let jitter_ms = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_millis() as u64)
+        .unwrap_or(0))
+        % 150;
+    Duration::from_millis(base_ms + jitter_ms)
+}
+
+fn truncate_for_error(s: &str) -> String {
+    const MAX: usize = 400;
+    if s.len() <= MAX {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..MAX])
     }
 }
 

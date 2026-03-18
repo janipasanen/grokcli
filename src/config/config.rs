@@ -26,6 +26,8 @@ pub struct AppConfig {
     pub timeout_seconds: u64,
     #[serde(default = "default_api_mode")]
     pub api_mode: String,
+    #[serde(default = "default_auto_approve")]
+    pub auto_approve: bool,
 }
 
 impl Default for AppConfig {
@@ -41,6 +43,7 @@ impl Default for AppConfig {
             store: default_store(),
             timeout_seconds: default_timeout_seconds(),
             api_mode: default_api_mode(),
+            auto_approve: default_auto_approve(),
         }
     }
 }
@@ -110,4 +113,8 @@ fn default_timeout_seconds() -> u64 {
 
 fn default_api_mode() -> String {
     "responses".to_string()
+}
+
+fn default_auto_approve() -> bool {
+    false
 }

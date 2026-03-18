@@ -2,7 +2,7 @@ use crate::config::config::AppConfig;
 use crate::persistence::session_store::SessionStore;
 use crate::provider::models::build_simple_request;
 use crate::provider::xai_client::XaiClient;
-use crate::tools::registry::{ToolCallRequest, ToolRegistry};
+use crate::tools::registry::{ToolCallRequest, ToolCallResult, ToolRegistry};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::env;
@@ -192,10 +192,9 @@ impl AgentRuntime {
                       "call_id": call.call_id
                     }),
                 )?;
-                let result = registry.execute(ToolCallRequest {
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                })?;
+                let result = self
+                    .execute_with_approval(registry, &call.name, &call.arguments)?
+                    .0;
                 session.append(
                     "tool_result",
                     json!({
@@ -205,6 +204,13 @@ impl AgentRuntime {
                     }),
                 )?;
                 eprintln!("tool: {}", call.name);
+                if needs_approval_without_auto(&result.result, self.cfg.auto_approve) {
+                    eprintln!(
+                        "approval required for tool '{}' (rerun with --auto-approve to continue)",
+                        call.name
+                    );
+                    return Ok(());
+                }
                 outputs.push(json!({
                     "type": "function_call_output",
                     "call_id": call.call_id,
@@ -294,10 +300,9 @@ impl AgentRuntime {
                       "call_id": call.call_id
                     }),
                 )?;
-                let result = registry.execute(ToolCallRequest {
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                })?;
+                let result = self
+                    .execute_with_approval(registry, &call.name, &call.arguments)?
+                    .0;
                 session.append(
                     "tool_result",
                     json!({
@@ -307,6 +312,13 @@ impl AgentRuntime {
                     }),
                 )?;
                 eprintln!("tool: {}", call.name);
+                if needs_approval_without_auto(&result.result, self.cfg.auto_approve) {
+                    eprintln!(
+                        "approval required for tool '{}' (rerun with --auto-approve to continue)",
+                        call.name
+                    );
+                    return Ok(());
+                }
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": call.call_id,
@@ -316,6 +328,33 @@ impl AgentRuntime {
         }
 
         Ok(())
+    }
+
+    fn execute_with_approval(
+        &self,
+        registry: &ToolRegistry,
+        name: &str,
+        args: &Value,
+    ) -> Result<(ToolCallResult, bool)> {
+        let first = registry.execute(ToolCallRequest {
+            name: name.to_string(),
+            arguments: args.clone(),
+        })?;
+        if !self.cfg.auto_approve || !result_is_approval_required(&first.result) {
+            return Ok((first, false));
+        }
+
+        let mut approved_args = args.clone();
+        if let Some(map) = approved_args.as_object_mut() {
+            map.insert("approved".to_string(), json!(true));
+        } else {
+            approved_args = json!({ "approved": true });
+        }
+        let second = registry.execute(ToolCallRequest {
+            name: name.to_string(),
+            arguments: approved_args,
+        })?;
+        Ok((second, true))
     }
 }
 
@@ -438,4 +477,15 @@ fn extract_chat_tool_calls(message: &Value) -> Vec<PendingToolCall> {
         });
     }
     calls
+}
+
+fn result_is_approval_required(result: &Value) -> bool {
+    result
+        .get("approval_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn needs_approval_without_auto(result: &Value, auto_approve: bool) -> bool {
+    !auto_approve && result_is_approval_required(result)
 }
