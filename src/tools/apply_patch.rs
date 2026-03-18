@@ -96,7 +96,7 @@ fn normalize_patch(patch: &str) -> std::result::Result<String, String> {
     if patch.lines().any(|line| line.starts_with("*** Begin Patch")) {
         return codex_patch_to_unified_diff(&patch);
     }
-    Ok(patch)
+    Ok(normalize_unified_diff_hunks(&patch))
 }
 
 fn codex_patch_to_unified_diff(patch: &str) -> std::result::Result<String, String> {
@@ -236,6 +236,105 @@ fn strip_markdown_fence(input: &str) -> Option<String> {
     let rest = &input[content_start..];
     let close = rest.rfind("\n```")?;
     Some(rest[..close].to_string())
+}
+
+fn normalize_unified_diff_hunks(patch: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_hunk = false;
+    let mut old_start = 1usize;
+    let mut new_start = 1usize;
+    let mut hunk_start_idx: Option<usize> = None;
+    let mut old_count = 0usize;
+    let mut new_count = 0usize;
+
+    let flush_hunk_header = |out: &mut Vec<String>,
+                             hunk_start_idx: Option<usize>,
+                             old_start: usize,
+                             old_count: usize,
+                             new_start: usize,
+                             new_count: usize| {
+        if let Some(idx) = hunk_start_idx
+            && out.get(idx).map(|line| line.trim()) == Some("@@")
+        {
+            out[idx] = format!(
+                "@@ -{} +{} @@",
+                hunk_range(old_start, old_count),
+                hunk_range(new_start, new_count)
+            );
+        }
+    };
+
+    for raw_line in patch.lines() {
+        let is_header = raw_line.starts_with("diff --git ")
+            || raw_line.starts_with("--- ")
+            || raw_line.starts_with("+++ ")
+            || raw_line.starts_with("index ")
+            || raw_line.starts_with("new file mode ")
+            || raw_line.starts_with("deleted file mode ");
+
+        if in_hunk && (is_header || raw_line.starts_with("@@")) {
+            flush_hunk_header(
+                &mut out,
+                hunk_start_idx,
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+            );
+            old_start += old_count;
+            new_start += new_count;
+            old_count = 0;
+            new_count = 0;
+            hunk_start_idx = None;
+            if is_header {
+                in_hunk = false;
+            }
+        }
+
+        if raw_line.starts_with("@@") {
+            in_hunk = true;
+            let line = raw_line.trim().to_string();
+            if line == "@@" {
+                hunk_start_idx = Some(out.len());
+            }
+            out.push(line);
+            continue;
+        }
+
+        if in_hunk {
+            let normalized = normalize_hunk_line(raw_line);
+            match normalized.chars().next() {
+                Some(' ') => {
+                    old_count += 1;
+                    new_count += 1;
+                }
+                Some('-') => old_count += 1,
+                Some('+') => new_count += 1,
+                _ => {}
+            }
+            out.push(normalized);
+            continue;
+        }
+
+        out.push(raw_line.to_string());
+    }
+
+    if in_hunk {
+        flush_hunk_header(
+            &mut out,
+            hunk_start_idx,
+            old_start,
+            old_count,
+            new_start,
+            new_count,
+        );
+    }
+
+    let mut normalized = out.join("\n");
+    if !normalized.ends_with('\n') {
+        normalized.push('\n');
+    }
+    normalized
 }
 
 fn normalize_codex_hunks_or_wrap(section: &[String]) -> Vec<String> {
@@ -573,6 +672,38 @@ new
         assert!(result.valid, "{}", result.check_stderr);
         assert!(result.applied, "{}", result.apply_stderr);
         assert_eq!(fs::read_to_string(dir.path().join("demo.txt"))?, "hello\n");
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_unified_diff_with_bare_hunk_header() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("demo.txt"), "old\n")?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+diff --git a/demo.txt b/demo.txt
+--- a/demo.txt
++++ b/demo.txt
+@@
+-old
++new
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(result.valid, "{}", result.check_stderr);
+        assert!(result.applied, "{}", result.apply_stderr);
+        assert_eq!(fs::read_to_string(dir.path().join("demo.txt"))?, "new\n");
         Ok(())
     }
 }
