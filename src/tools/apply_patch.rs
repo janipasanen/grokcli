@@ -150,7 +150,10 @@ fn codex_patch_to_unified_diff(patch: &str) -> std::result::Result<String, Strin
             continue;
         }
 
-        if let Some(path) = line.strip_prefix("*** Add File: ") {
+        if let Some(path) = line
+            .strip_prefix("*** Add File: ")
+            .or_else(|| line.strip_prefix("*** New File: "))
+        {
             let mut section = Vec::new();
             while let Some(next) = lines.peek().copied() {
                 if next.starts_with("*** ") {
@@ -541,6 +544,35 @@ new
             !result.valid || !result.applied,
             "unprefixed full-replacement patch should not silently produce an unsafe rewrite"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_new_file_alias_in_codex_patch() -> Result<()> {
+        let dir = tempdir()?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+*** Begin Patch
+*** New File: demo.txt
++hello
+*** End Patch
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(result.valid, "{}", result.check_stderr);
+        assert!(result.applied, "{}", result.apply_stderr);
+        assert_eq!(fs::read_to_string(dir.path().join("demo.txt"))?, "hello\n");
         Ok(())
     }
 }
