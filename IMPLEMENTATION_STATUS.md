@@ -54,3 +54,4 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 - 2026-03-18: Added richer CLI help UX: grouped sections, long help text, extended help output via `--show-help-sections`, and explicit option descriptions.
 - 2026-03-18: Added clearer startup text response header (mode/model/api/limits/session info).
 - 2026-03-18: Added provider trait abstraction and first integration test harness with mock provider for tool-calling loop.
+- 2026-03-18: Implemented streaming Responses loop handling that returns immediately on tool-call events and continues streaming text deltas.

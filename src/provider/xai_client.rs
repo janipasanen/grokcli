@@ -160,8 +160,17 @@ impl XaiClient {
                             }
                         }
                         if let Some(resp) = value.get("response") {
-                            final_response = Some(resp.clone());
+                            let resp = resp.clone();
+                            if has_function_call(&resp) {
+                                println!();
+                                return Ok(resp);
+                            }
+                            final_response = Some(resp);
                         } else if value.get("output").is_some() && value.get("id").is_some() {
+                            if has_function_call(&value) {
+                                println!();
+                                return Ok(value.clone());
+                            }
                             final_response = Some(value.clone());
                         }
                     }
@@ -223,6 +232,21 @@ impl XaiClient {
 
         Ok(collected)
     }
+}
+
+fn has_function_call(response: &Value) -> bool {
+    response
+        .get("output")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter().any(|item| {
+                item.get("type")
+                    .and_then(Value::as_str)
+                    .map(|t| t == "function_call" || t.ends_with(".function_call"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 #[async_trait]
