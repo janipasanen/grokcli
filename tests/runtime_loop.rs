@@ -325,3 +325,23 @@ fn tool_registry_checkpoint_and_undo_require_approval() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn tool_registry_apply_patch_description_mentions_supported_format() {
+    let registry = ToolRegistry::new(".");
+    let defs = registry.definitions_json();
+    let apply_patch = defs
+        .as_array()
+        .and_then(|defs| {
+            defs.iter()
+                .find(|def| def.get("name").and_then(Value::as_str) == Some("apply_patch"))
+        })
+        .expect("apply_patch definition");
+    let description = apply_patch
+        .get("description")
+        .and_then(Value::as_str)
+        .expect("apply_patch description");
+
+    assert!(description.contains("raw unified diff"));
+    assert!(description.contains("*** Begin Patch"));
+}
