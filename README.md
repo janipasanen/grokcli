@@ -73,10 +73,44 @@ Run a prompt:
 grokcli "explain this repo"
 ```
 
+Run the interactive shell:
+
+```bash
+grokcli
+```
+
 Show help:
 
 ```bash
 grokcli --help
+```
+
+### Interactive shell
+
+Starting `grokcli` with no prompt opens a text-entry shell. Type a normal prompt and press Enter to run it. Type `/` or `/help` to see the available slash commands.
+
+Common interactive commands:
+
+- `/show` prints the current mode, model, API mode, step limit, approval mode, preset, and context budget.
+- `/mode <ask|edit|agent>` switches between single-turn and multi-step behavior.
+- `/model <name>` changes the Grok model for the current shell session.
+- `/api-mode <responses|chat-completions>` switches the provider path.
+- `/max-steps <n>` changes the agent loop limit for `edit` and `agent` mode.
+- `/auto-approve <on|off>` toggles approval bypass.
+- `/stream <on|off>` toggles streaming output.
+- `/preset <rust-tests|swift-build|review-changed|off>` applies or clears a workflow preset.
+- `/resume-latest`, `/resume <id|path>`, and `/new-session` manage session continuity.
+- `/exit` leaves the shell.
+
+Example shell session:
+
+```text
+$ grokcli
+grok> /mode agent
+grok> /model grok-code-fast-1
+grok> inspect this repo and tell me why the build fails
+grok> /show
+grok> /exit
 ```
 
 ### General usage
