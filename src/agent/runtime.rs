@@ -271,6 +271,7 @@ impl AgentRuntime {
                       "call_id": call.call_id
                     }),
                 )?;
+                emit_tool_notice(session, &call.name, &result.result)?;
                 maybe_record_applied_patch(
                     &call.name,
                     &call.arguments,
@@ -390,6 +391,7 @@ impl AgentRuntime {
                       "call_id": call.call_id
                     }),
                 )?;
+                emit_tool_notice(session, &call.name, &result.result)?;
                 maybe_record_applied_patch(
                     &call.name,
                     &call.arguments,
@@ -663,6 +665,57 @@ fn render_patch_preview(patch: &str) {
         eprintln!("{line}");
         count += 1;
     }
+}
+
+fn emit_tool_notice(session: &SessionStore, tool_name: &str, result: &Value) -> Result<()> {
+    match tool_name {
+        "checkpoint_repo" => {
+            let created = result
+                .get("created")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let path = result
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if created {
+                eprintln!("checkpoint created: {path}");
+            }
+            session.append(
+                "tool_notice",
+                json!({
+                    "tool": tool_name,
+                    "created": created,
+                    "path": path
+                }),
+            )?;
+        }
+        "undo_last_patch" => {
+            let undone = result
+                .get("undone")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let message = result
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if !message.is_empty() {
+                eprintln!("{message}");
+            } else if undone {
+                eprintln!("undo completed");
+            }
+            session.append(
+                "tool_notice",
+                json!({
+                    "tool": tool_name,
+                    "undone": undone,
+                    "message": message
+                }),
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn approval_cache_key(tool_name: &str, args: &Value, reason: Option<&str>) -> Option<String> {
