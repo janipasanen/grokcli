@@ -10,6 +10,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::env;
+use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 
 pub struct AgentRuntime {
@@ -357,6 +358,7 @@ impl AgentRuntime {
                     &call.arguments,
                     &result.result,
                 );
+                emit_tool_result_preview(&call.name, &result.result);
                 maybe_record_applied_patch(
                     &call.name,
                     &call.arguments,
@@ -513,6 +515,7 @@ impl AgentRuntime {
                     &call.arguments,
                     &result.result,
                 );
+                emit_tool_result_preview(&call.name, &result.result);
                 maybe_record_applied_patch(
                     &call.name,
                     &call.arguments,
@@ -996,6 +999,245 @@ fn verification_tool_name(tool_name: &str, args: &Value) -> String {
             .unwrap_or_else(|| tool_name.to_string()),
         _ => tool_name.to_string(),
     }
+}
+
+fn emit_tool_result_preview(tool_name: &str, result: &Value) {
+    if let Some(preview) = render_tool_result_preview(tool_name, result) {
+        eprintln!("{preview}");
+    }
+}
+
+fn render_tool_result_preview(tool_name: &str, result: &Value) -> Option<String> {
+    match tool_name {
+        "read_file" => render_read_file_result(result),
+        "list_directory" => render_list_directory_result(result),
+        "apply_patch" => Some(render_apply_patch_result(result)),
+        "checkpoint_repo" => Some(render_checkpoint_result(result)),
+        "undo_last_patch" => Some(render_undo_result(result)),
+        _ if is_command_like_result(result) => Some(render_command_like_result(tool_name, result)),
+        _ => serde_json::to_string_pretty(result)
+            .ok()
+            .map(|body| format!("tool result: {tool_name}\n{body}")),
+    }
+}
+
+fn render_read_file_result(result: &Value) -> Option<String> {
+    let path = result.get("path").and_then(Value::as_str)?;
+    let content = result.get("content").and_then(Value::as_str).unwrap_or_default();
+    let was_truncated = result
+        .get("was_truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let preview = truncate_preview_text(content);
+    let mut out = format!("tool result: read_file path={path:?} truncated={was_truncated}");
+    if preview.is_empty() {
+        return Some(out);
+    }
+    out.push('\n');
+    out.push_str(&preview);
+    Some(out)
+}
+
+fn render_list_directory_result(result: &Value) -> Option<String> {
+    let path = result.get("path").and_then(Value::as_str).unwrap_or(".");
+    let entries = result.get("entries").and_then(Value::as_array)?;
+    let was_truncated = result
+        .get("was_truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut body = String::new();
+    for entry in entries {
+        if let Some(name) = entry.as_str() {
+            let _ = writeln!(&mut body, "{name}");
+        }
+    }
+    let preview = truncate_preview_text(&body);
+    Some(format!(
+        "tool result: list_directory path={path:?} entries={} truncated={was_truncated}\n{}",
+        entries.len(),
+        preview
+    ))
+}
+
+fn render_command_like_result(tool_name: &str, result: &Value) -> String {
+    let command = result.get("command").and_then(Value::as_str);
+    let cwd = result.get("working_directory").and_then(Value::as_str);
+    let exit_code = result.get("exit_code").and_then(Value::as_i64);
+    let duration_ms = result.get("duration_ms").and_then(Value::as_u64);
+    let timed_out = result
+        .get("timed_out")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let blocked = result
+        .get("blocked")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let approval_required = result
+        .get("approval_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let was_truncated = result
+        .get("was_truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let decision_reason = result
+        .get("decision_reason")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+
+    let mut out = format!("tool result: {tool_name}");
+    if let Some(command) = command {
+        let _ = write!(&mut out, " command={command:?}");
+    }
+    if let Some(cwd) = cwd {
+        let _ = write!(&mut out, " cwd={cwd:?}");
+    }
+    if let Some(exit_code) = exit_code {
+        let _ = write!(&mut out, " exit_code={exit_code}");
+    }
+    if let Some(duration_ms) = duration_ms {
+        let _ = write!(&mut out, " duration={}ms", duration_ms);
+    }
+    let _ = write!(
+        &mut out,
+        " timed_out={} blocked={} approval_required={} truncated={}",
+        timed_out, blocked, approval_required, was_truncated
+    );
+    if let Some(reason) = decision_reason {
+        let _ = write!(&mut out, " reason={reason:?}");
+    }
+
+    let stdout = result.get("stdout").and_then(Value::as_str).unwrap_or_default();
+    let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or_default();
+    if !stdout.is_empty() {
+        out.push_str("\nstdout:\n");
+        out.push_str(&truncate_preview_text(stdout));
+    }
+    if !stderr.is_empty() {
+        out.push_str("\nstderr:\n");
+        out.push_str(&truncate_preview_text(stderr));
+    }
+    out
+}
+
+fn render_apply_patch_result(result: &Value) -> String {
+    let valid = result.get("valid").and_then(Value::as_bool).unwrap_or(false);
+    let applied = result.get("applied").and_then(Value::as_bool).unwrap_or(false);
+    let approval_required = result
+        .get("approval_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut out = format!(
+        "tool result: apply_patch valid={} applied={} approval_required={}",
+        valid, applied, approval_required
+    );
+    let check_stderr = result
+        .get("check_stderr")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !check_stderr.is_empty() {
+        out.push_str("\ncheck_stderr:\n");
+        out.push_str(&truncate_preview_text(check_stderr));
+    }
+    let apply_stderr = result
+        .get("apply_stderr")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !apply_stderr.is_empty() {
+        out.push_str("\napply_stderr:\n");
+        out.push_str(&truncate_preview_text(apply_stderr));
+    }
+    out
+}
+
+fn render_checkpoint_result(result: &Value) -> String {
+    let created = result
+        .get("created")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let approval_required = result
+        .get("approval_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let path = result.get("path").and_then(Value::as_str).unwrap_or("");
+    let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or_default();
+    let mut out = format!(
+        "tool result: checkpoint_repo created={} approval_required={} path={path:?}",
+        created, approval_required
+    );
+    if !stderr.is_empty() {
+        out.push_str("\nstderr:\n");
+        out.push_str(&truncate_preview_text(stderr));
+    }
+    out
+}
+
+fn render_undo_result(result: &Value) -> String {
+    let undone = result
+        .get("undone")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let approval_required = result
+        .get("approval_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let message = result
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if message.is_empty() {
+        format!(
+            "tool result: undo_last_patch undone={} approval_required={}",
+            undone, approval_required
+        )
+    } else {
+        format!(
+            "tool result: undo_last_patch undone={} approval_required={}\n{}",
+            undone,
+            approval_required,
+            truncate_preview_text(message)
+        )
+    }
+}
+
+fn is_command_like_result(result: &Value) -> bool {
+    result.get("stdout").is_some() || result.get("stderr").is_some()
+}
+
+fn truncate_preview_text(text: &str) -> String {
+    const MAX_LINES: usize = 120;
+    const MAX_BYTES: usize = 12 * 1024;
+
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    let mut truncated = false;
+
+    for (idx, line) in text.lines().enumerate() {
+        let extra = if idx == 0 { line.len() } else { line.len() + 1 };
+        if idx >= MAX_LINES || out.len() + extra > MAX_BYTES {
+            truncated = true;
+            break;
+        }
+        if idx > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+
+    if out.is_empty() && !text.is_empty() {
+        out = text.chars().take(512).collect();
+        if out.len() < text.len() {
+            truncated = true;
+        }
+    }
+
+    if truncated {
+        out.push_str("\n...[tool output truncated]...");
+    }
+    out
 }
 
 fn emit_tool_notice(session: &SessionStore, tool_name: &str, result: &Value) -> Result<()> {

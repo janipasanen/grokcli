@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tempfile::tempdir;
 
 #[derive(Clone)]
@@ -32,6 +32,11 @@ impl MockProvider {
     fn recorded_requests(&self) -> Vec<Value> {
         self.requests.lock().unwrap().clone()
     }
+}
+
+fn test_env_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
 }
 
 #[async_trait]
@@ -101,6 +106,7 @@ fn chat_final_response() -> Value {
 
 #[tokio::test]
 async fn runtime_executes_tool_and_returns_result_in_next_request() -> Result<()> {
+    let _guard = test_env_guard();
     let dir = tempdir()?;
     unsafe {
         std::env::set_var("HOME", dir.path());
@@ -166,6 +172,7 @@ fn responses_final_response() -> Value {
 
 #[tokio::test]
 async fn runtime_streaming_responses_executes_tool() -> Result<()> {
+    let _guard = test_env_guard();
     let dir = tempdir()?;
     unsafe {
         std::env::set_var("HOME", dir.path());
@@ -196,6 +203,7 @@ async fn runtime_streaming_responses_executes_tool() -> Result<()> {
 
 #[tokio::test]
 async fn runtime_forces_store_true_for_multi_step_responses() -> Result<()> {
+    let _guard = test_env_guard();
     let dir = tempdir()?;
     unsafe {
         std::env::set_var("HOME", dir.path());
@@ -224,6 +232,7 @@ async fn runtime_forces_store_true_for_multi_step_responses() -> Result<()> {
 
 #[tokio::test]
 async fn runtime_omits_instructions_on_responses_continuation() -> Result<()> {
+    let _guard = test_env_guard();
     let dir = tempdir()?;
     unsafe {
         std::env::set_var("HOME", dir.path());
@@ -264,6 +273,7 @@ async fn runtime_omits_instructions_on_responses_continuation() -> Result<()> {
 
 #[test]
 fn tool_registry_run_tests_and_build_project() -> Result<()> {
+    let _guard = test_env_guard();
     let dir = tempdir()?;
     std::fs::write(
         dir.path().join("Cargo.toml"),
@@ -294,6 +304,7 @@ fn tool_registry_run_tests_and_build_project() -> Result<()> {
 
 #[test]
 fn tool_registry_checkpoint_and_undo_require_approval() -> Result<()> {
+    let _guard = test_env_guard();
     let dir = tempdir()?;
     let registry = ToolRegistry::new(dir.path());
 
