@@ -12,13 +12,15 @@ use tempfile::tempdir;
 #[derive(Clone)]
 struct MockProvider {
     responses: Arc<Mutex<VecDeque<Value>>>,
+    responses_stream: Arc<Mutex<VecDeque<Value>>>,
     requests: Arc<Mutex<Vec<Value>>>,
 }
 
 impl MockProvider {
-    fn new(responses: Vec<Value>) -> Self {
+    fn new(responses: Vec<Value>, responses_stream: Vec<Value>) -> Self {
         Self {
             responses: Arc::new(Mutex::new(VecDeque::from(responses))),
+            responses_stream: Arc::new(Mutex::new(VecDeque::from(responses_stream))),
             requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -39,11 +41,19 @@ impl LanguageModelProvider for MockProvider {
     }
 
     async fn create_response_json(&self, _body: &Value) -> Result<Value> {
-        bail!("not used in this test")
+        self.requests.lock().unwrap().push(_body.clone());
+        let mut responses = self.responses.lock().unwrap();
+        responses
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("no more mock responses queued"))
     }
 
     async fn create_response_stream_json(&self, _body: &Value) -> Result<Value> {
-        bail!("not used in this test")
+        self.requests.lock().unwrap().push(_body.clone());
+        let mut responses = self.responses_stream.lock().unwrap();
+        responses
+            .pop_front()
+            .ok_or_else(|| anyhow::anyhow!("no more mock streaming responses queued"))
     }
 
     async fn create_chat_completion_json(&self, body: &Value) -> Result<Value> {
@@ -95,7 +105,10 @@ async fn runtime_executes_tool_and_returns_result_in_next_request() -> Result<()
     std::fs::write(dir.path().join("alpha.txt"), "alpha")?;
     std::fs::write(dir.path().join("beta.txt"), "beta")?;
 
-    let provider = MockProvider::new(vec![chat_tool_call_response(), chat_final_response()]);
+    let provider = MockProvider::new(
+        vec![chat_tool_call_response(), chat_final_response()],
+        Vec::new(),
+    );
     let mut cfg = AppConfig::default();
     cfg.api_mode = "chat_completions".to_string();
     cfg.stream = false;
@@ -121,5 +134,56 @@ async fn runtime_executes_tool_and_returns_result_in_next_request() -> Result<()
         .unwrap_or("");
     assert!(content.contains("alpha.txt"), "expected tool output to include alpha.txt");
 
+    Ok(())
+}
+
+fn responses_tool_call_response() -> Value {
+    json!({
+        "id": "resp_1",
+        "output": [{
+            "type": "function_call",
+            "name": "list_directory",
+            "call_id": "call_1",
+            "arguments": "{\"path\":\".\"}"
+        }]
+    })
+}
+
+fn responses_final_response() -> Value {
+    json!({
+        "id": "resp_2",
+        "output": [{
+            "content": [{
+                "text": "done"
+            }]
+        }]
+    })
+}
+
+#[tokio::test]
+async fn runtime_streaming_responses_executes_tool() -> Result<()> {
+    let dir = tempdir()?;
+    unsafe {
+        std::env::set_var("HOME", dir.path());
+    }
+    std::env::set_current_dir(dir.path())?;
+    std::fs::write(dir.path().join("alpha.txt"), "alpha")?;
+
+    let provider = MockProvider::new(
+        vec![responses_final_response()],
+        vec![responses_tool_call_response()],
+    );
+    let mut cfg = AppConfig::default();
+    cfg.api_mode = "responses".to_string();
+    cfg.stream = true;
+    let runtime = AgentRuntime::new(cfg, 3);
+    runtime
+        .run_ask(&provider, "list files".to_string(), None)
+        .await?;
+
+    let requests = provider.recorded_requests();
+    assert!(requests.len() >= 2, "expected at least two provider calls");
+    let first = &requests[0];
+    assert!(first.get("input").is_some(), "responses request should include input");
     Ok(())
 }

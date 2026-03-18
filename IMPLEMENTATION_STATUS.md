@@ -61,3 +61,4 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 - 2026-03-18: Added first-class tools for tests/build/lint/format, checkpoint, and undo, wiring them into registry and tool definitions.
 - 2026-03-18: Updated workflow presets to use first-class tools and added context-budget unit test.
 - 2026-03-18: Extended approval cache to cover run_tests/run_linter/run_formatter/build_project tools.
+- 2026-03-18: Added integration test for streaming Responses tool-call loop with mock provider.
