@@ -3,7 +3,9 @@ use grokcli::config::config::AppConfig;
 use grokcli::persistence::patch_store::PatchStore;
 use grokcli::persistence::session_store::{SessionStore, latest_session_path, resolve_session_path};
 use grokcli::provider::xai_client::XaiClient;
-use grokcli::workflows::presets::{WorkflowPreset, apply_preset_prompt};
+use grokcli::workflows::presets::{
+    WorkflowPreset, apply_preset_prompt, infer_preset_for_prompt,
+};
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use std::env;
@@ -169,13 +171,19 @@ async fn main() -> Result<()> {
     let base_prompt = cli
         .prompt
         .ok_or_else(|| anyhow::anyhow!("prompt is required unless --undo-last-patch is used"))?;
-    let prompt = apply_selected_preset(cli.preset.as_ref(), &base_prompt);
+    let repo_root = env::current_dir()?;
+    let (prompt, effective_preset) =
+        prepare_prompt(&repo_root, cli.preset.as_ref(), &selected_mode, &base_prompt);
     print_run_header(
         &selected_mode,
         header_model,
         header_api_mode,
         effective_max_steps(&selected_mode, cli.max_steps),
         header_auto_approve,
+        effective_preset
+            .as_ref()
+            .and_then(|p| p.to_possible_value())
+            .map(|v| v.get_name().to_string()),
         resume_store
             .as_ref()
             .map(|s| s.path().to_string_lossy().to_string()),
@@ -287,7 +295,16 @@ async fn run_interactive_shell(client: &XaiClient, mut state: InteractiveState) 
                     state.cfg.clone(),
                     effective_max_steps(&state.mode, state.max_steps),
                 );
-                let prompt = apply_selected_preset(state.preset.as_ref(), &prompt);
+                let repo_root = env::current_dir()?;
+                let (prompt, effective_preset) =
+                    prepare_prompt(&repo_root, state.preset.as_ref(), &state.mode, &prompt);
+                if state.preset.is_none() {
+                    if let Some(preset) = effective_preset.as_ref() {
+                        if let Some(value) = preset.to_possible_value() {
+                            eprintln!("inferred_preset={}", value.get_name());
+                        }
+                    }
+                }
                 runtime
                     .run_ask(client, prompt, Some(state.session.clone()))
                     .await?;
@@ -448,6 +465,23 @@ fn apply_selected_preset(preset: Option<&WorkflowPreset>, prompt: &str) -> Strin
     }
 }
 
+fn prepare_prompt(
+    repo_root: &std::path::Path,
+    preset: Option<&WorkflowPreset>,
+    mode: &AgentMode,
+    prompt: &str,
+) -> (String, Option<WorkflowPreset>) {
+    let effective_preset = match preset {
+        Some(preset) => Some(preset.clone()),
+        None if !matches!(mode, AgentMode::Ask) => infer_preset_for_prompt(repo_root, prompt),
+        None => None,
+    };
+    (
+        apply_selected_preset(effective_preset.as_ref(), prompt),
+        effective_preset,
+    )
+}
+
 fn effective_max_steps(mode: &AgentMode, max_steps: u32) -> u32 {
     match mode {
         AgentMode::Ask => 1,
@@ -469,12 +503,16 @@ fn print_run_header(
     api_mode: String,
     max_steps: u32,
     auto_approve: bool,
+    effective_preset: Option<String>,
     resumed_session: Option<String>,
 ) {
     eprintln!(
         "mode={} model={} api_mode={} max_steps={} auto_approve={}",
         mode_name(mode), model, api_mode, max_steps, auto_approve
     );
+    if let Some(preset) = effective_preset {
+        eprintln!("effective_preset={preset}");
+    }
     if let Some(path) = resumed_session {
         eprintln!("resuming_session={}", path);
     }
@@ -514,5 +552,38 @@ mod tests {
             Ok(InteractiveCommand::Prompt(prompt)) => assert_eq!(prompt, "fix failing tests"),
             other => panic!("unexpected parse result: {:?}", other),
         }
+    }
+
+    #[test]
+    fn prepare_prompt_infers_swift_build_for_non_ask_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("Package.swift"), "// swift-tools-version:5.3\n")
+            .expect("write Package.swift");
+        let (prompt, preset) = prepare_prompt(
+            dir.path(),
+            None,
+            &AgentMode::Agent,
+            "swift test fails with cannot find 'Application' in scope",
+        );
+        assert!(prompt.contains("Swift build/test fix workflow."));
+        assert_eq!(preset, Some(WorkflowPreset::SwiftBuild));
+    }
+
+    #[test]
+    fn prepare_prompt_does_not_infer_for_ask_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("Package.swift"), "// swift-tools-version:5.3\n")
+            .expect("write Package.swift");
+        let (prompt, preset) = prepare_prompt(
+            dir.path(),
+            None,
+            &AgentMode::Ask,
+            "swift test fails with cannot find 'Application' in scope",
+        );
+        assert_eq!(
+            prompt,
+            "swift test fails with cannot find 'Application' in scope"
+        );
+        assert_eq!(preset, None);
     }
 }

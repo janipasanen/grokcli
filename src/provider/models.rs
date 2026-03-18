@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 pub struct ResponsesRequest {
     pub model: String,
     pub input: Vec<InputMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     pub stream: bool,
     pub parallel_tool_calls: bool,
     pub store: bool,
@@ -58,6 +60,7 @@ pub fn build_simple_request(
                 text: prompt,
             }],
         }],
+        instructions: None,
         stream,
         parallel_tool_calls,
         store,

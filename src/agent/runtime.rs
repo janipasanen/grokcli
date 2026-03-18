@@ -1,4 +1,5 @@
 use crate::agent::context_budget::ContextBudgetManager;
+use crate::agent::instructions::{build_multi_step_instructions, build_single_step_instructions};
 use crate::config::config::AppConfig;
 use crate::persistence::patch_store::PatchStore;
 use crate::persistence::session_store::SessionStore;
@@ -42,12 +43,17 @@ impl AgentRuntime {
             )?;
         }
         session.append("user_message", SessionStore::prompt_payload(&prompt))?;
+        let repo_root = env::current_dir()?;
 
         if self.max_steps <= 1 {
+            let single_step_instructions = build_single_step_instructions(&repo_root);
             let text = if self.cfg.api_mode.eq_ignore_ascii_case("chat_completions") {
                 let body = json!({
                     "model": normalize_model_name(&self.cfg.model),
-                    "messages": [{ "role": "user", "content": prompt }],
+                    "messages": [
+                        { "role": "system", "content": single_step_instructions.clone() },
+                        { "role": "user", "content": prompt.clone() }
+                    ],
                     "stream": false,
                     "temperature": self.cfg.temperature
                 });
@@ -61,7 +67,7 @@ impl AgentRuntime {
                     .unwrap_or_default()
                     .to_string()
             } else {
-                let request = build_simple_request(
+                let mut request = build_simple_request(
                     self.cfg.model.clone(),
                     prompt.clone(),
                     self.cfg.stream,
@@ -70,6 +76,7 @@ impl AgentRuntime {
                     self.cfg.max_output_tokens,
                     self.cfg.temperature,
                 );
+                request.instructions = Some(single_step_instructions.clone());
                 let resp = if self.cfg.stream {
                     let t = client.stream_response_text(&request).await;
                     println!();
@@ -83,7 +90,10 @@ impl AgentRuntime {
                         eprintln!("responses endpoint unavailable, falling back to /v1/chat/completions");
                         let body = json!({
                             "model": normalize_model_name(&self.cfg.model),
-                            "messages": [{ "role": "user", "content": prompt }],
+                            "messages": [
+                                { "role": "system", "content": single_step_instructions.clone() },
+                                { "role": "user", "content": prompt.clone() }
+                            ],
                             "stream": false,
                             "temperature": self.cfg.temperature
                         });
@@ -109,7 +119,6 @@ impl AgentRuntime {
             return Ok(());
         }
 
-        let repo_root = env::current_dir()?;
         let registry = ToolRegistry::new(&repo_root);
         let mut approval_cache = HashSet::new();
         if self.cfg.api_mode.eq_ignore_ascii_case("chat_completions") {
@@ -202,6 +211,7 @@ impl AgentRuntime {
     ) -> Result<()> {
         let mut previous_response_id = resumed_previous_response_id;
         let mut budget = ContextBudgetManager::new(self.cfg.context_budget_bytes);
+        let instructions = build_multi_step_instructions(repo_root);
         let store = true;
         if !self.cfg.store {
             eprintln!(
@@ -212,11 +222,13 @@ impl AgentRuntime {
             "role": "user",
             "content": [{ "type": "input_text", "text": prompt }]
         })];
+        let mut completed = false;
 
         for step in 0..self.max_steps {
             let body = json!({
                 "model": normalize_model_name(&self.cfg.model),
                 "input": pending_input,
+                "instructions": instructions.clone(),
                 "tools": registry.definitions_json(),
                 "stream": self.cfg.stream,
                 "parallel_tool_calls": self.cfg.parallel_tool_calls,
@@ -268,6 +280,7 @@ impl AgentRuntime {
             let tool_calls = extract_tool_calls(&response);
             if tool_calls.is_empty() {
                 println!();
+                completed = true;
                 break;
             }
 
@@ -323,6 +336,9 @@ impl AgentRuntime {
                 pending_input = outputs;
             }
         }
+        if !completed {
+            emit_max_steps_notice(session, self.max_steps)?;
+        }
         Ok(())
     }
 
@@ -335,11 +351,19 @@ impl AgentRuntime {
         approval_cache: &mut HashSet<String>,
         prompt: String,
     ) -> Result<()> {
-        let mut messages = vec![json!({
-            "role": "user",
-            "content": prompt
-        })];
+        let instructions = build_multi_step_instructions(repo_root);
+        let mut messages = vec![
+            json!({
+                "role": "system",
+                "content": instructions
+            }),
+            json!({
+                "role": "user",
+                "content": prompt
+            }),
+        ];
         let mut budget = ContextBudgetManager::new(self.cfg.context_budget_bytes);
+        let mut completed = false;
 
         for step in 0..self.max_steps {
             let body = json!({
@@ -389,6 +413,7 @@ impl AgentRuntime {
             let tool_calls = extract_chat_tool_calls(message);
             if tool_calls.is_empty() {
                 println!();
+                completed = true;
                 break;
             }
 
@@ -435,6 +460,10 @@ impl AgentRuntime {
                     "content": serde_json::to_string(&budgeted)?
                 }));
             }
+        }
+
+        if !completed {
+            emit_max_steps_notice(session, self.max_steps)?;
         }
 
         Ok(())
@@ -796,5 +825,21 @@ fn maybe_record_applied_patch(
     }
     let store = PatchStore::default()?;
     store.append(repo_root, patch, Some(session_path))?;
+    Ok(())
+}
+
+fn emit_max_steps_notice(session: &SessionStore, max_steps: u32) -> Result<()> {
+    let message = format!(
+        "max_steps ({max_steps}) reached before the task completed; increase the step limit or use a workflow preset."
+    );
+    eprintln!("{message}");
+    session.append(
+        "runtime_notice",
+        json!({
+            "kind": "max_steps_reached",
+            "max_steps": max_steps,
+            "message": message
+        }),
+    )?;
     Ok(())
 }

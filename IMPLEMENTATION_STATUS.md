@@ -71,3 +71,4 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 - 2026-03-18: Live-verified agentic tool-calling with `grok-code-fast-1`, `grok-4-1-fast-reasoning`, `grok-4-1-fast-non-reasoning`, `grok-4.20-beta-0309-reasoning`, and `grok-4.20-beta-0309-non-reasoning`.
 - 2026-03-18: Added preflight rejection for `grok-4.20-multi-agent-beta-0309` because xAI rejects client-side tools for that model.
 - 2026-03-18: Added a no-argument interactive shell with slash commands for model/mode/API/session/runtime settings and in-shell prompt execution.
+- 2026-03-18: Added built-in coding-agent instructions, automatic Rust/Swift build-fix preset inference, stronger tool descriptions, and explicit max-step exhaustion notices; live-verified that Swift failure prompts now start with `run_tests` instead of directory browsing.

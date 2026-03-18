@@ -118,7 +118,7 @@ impl ToolRegistry {
           {
             "type": "function",
             "name": "read_file",
-            "description": "Read a file from the repository.",
+            "description": "Read a file from the repository. Prefer focused reads of files already implicated by diagnostics or search results.",
             "parameters": {
               "type": "object",
               "properties": {
@@ -144,7 +144,7 @@ impl ToolRegistry {
           {
             "type": "function",
             "name": "search_text",
-            "description": "Search repository text using ripgrep.",
+            "description": "Search repository text using ripgrep to find symbols, errors, or references related to a failure.",
             "parameters": {
               "type": "object",
               "properties": {
@@ -158,7 +158,7 @@ impl ToolRegistry {
           {
             "type": "function",
             "name": "run_shell_command",
-            "description": "Run a shell command in the repository with policy checks.",
+            "description": "Run a shell command in the repository with policy checks. Prefer dedicated tools such as run_tests or build_project when they fit.",
             "parameters": {
               "type": "object",
               "properties": {
@@ -193,7 +193,7 @@ impl ToolRegistry {
           {
             "type": "function",
             "name": "apply_patch",
-            "description": "Validate and apply a unified diff patch.",
+            "description": "Validate and apply a unified diff patch. Use this when you have identified a code fix and need to modify files.",
             "parameters": {
               "type": "object",
               "properties": {
@@ -207,7 +207,7 @@ impl ToolRegistry {
           {
             "type": "function",
             "name": "build_project",
-            "description": "Run the project build for a given language (rust|swift).",
+            "description": "Run the project build for a given language (rust|swift). Use this early when the user reports a build or compiler failure.",
             "parameters": {
               "type": "object",
               "properties": {
@@ -219,7 +219,7 @@ impl ToolRegistry {
           {
             "type": "function",
             "name": "run_tests",
-            "description": "Run project tests for a given language (rust|swift).",
+            "description": "Run project tests for a given language (rust|swift). Use this early when the user reports failing tests or a reproducible build/test error.",
             "parameters": {
               "type": "object",
               "properties": {

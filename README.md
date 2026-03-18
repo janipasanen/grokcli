@@ -89,6 +89,8 @@ grokcli --help
 
 Starting `grokcli` with no prompt opens a text-entry shell. Type a normal prompt and press Enter to run it. Type `/` or `/help` to see the available slash commands.
 
+For Rust and Swift repositories, `agent` and `edit` mode now auto-infer a repair workflow when your prompt clearly describes a build or test failure. That means prompts like "swift test fails" or "cargo test fails" will automatically bias the agent toward `run_tests`, `build_project`, focused file reads, `apply_patch`, and verification reruns even if you do not manually set a preset.
+
 Common interactive commands:
 
 - `/show` prints the current mode, model, API mode, step limit, approval mode, preset, and context budget.
@@ -101,6 +103,8 @@ Common interactive commands:
 - `/preset <rust-tests|swift-build|review-changed|off>` applies or clears a workflow preset.
 - `/resume-latest`, `/resume <id|path>`, and `/new-session` manage session continuity.
 - `/exit` leaves the shell.
+
+If the agent wants to run `swift test`, `swift build`, `cargo test`, `cargo build`, or apply a patch, it will ask for approval unless you start the CLI with `--auto-approve` or toggle `/auto-approve on`.
 
 Example shell session:
 
