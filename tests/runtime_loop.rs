@@ -2,6 +2,10 @@ use grokcli::agent::runtime::AgentRuntime;
 use grokcli::config::config::AppConfig;
 use grokcli::provider::LanguageModelProvider;
 use grokcli::provider::models::ResponsesRequest;
+use grokcli::tools::registry::ToolRegistry;
+use grokcli::tools::run_shell_command::RunShellCommandResult;
+use grokcli::tools::checkpoint_repo::CheckpointRepoResult;
+use grokcli::tools::undo_last_patch::UndoLastPatchResult;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -185,5 +189,58 @@ async fn runtime_streaming_responses_executes_tool() -> Result<()> {
     assert!(requests.len() >= 2, "expected at least two provider calls");
     let first = &requests[0];
     assert!(first.get("input").is_some(), "responses request should include input");
+    Ok(())
+}
+
+#[test]
+fn tool_registry_run_tests_and_build_project() -> Result<()> {
+    let dir = tempdir()?;
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )?;
+    std::fs::create_dir_all(dir.path().join("src"))?;
+    std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n")?;
+
+    let registry = ToolRegistry::new(dir.path());
+    let run_tests = registry.execute(grokcli::tools::registry::ToolCallRequest {
+        name: "run_tests".to_string(),
+        arguments: json!({ "language": "rust", "approved": true }),
+    })?;
+    let run_tests_result: RunShellCommandResult =
+        serde_json::from_value(run_tests.result.clone())?;
+    assert!(run_tests_result.exit_code.is_some());
+
+    let build_project = registry.execute(grokcli::tools::registry::ToolCallRequest {
+        name: "build_project".to_string(),
+        arguments: json!({ "language": "rust", "approved": true }),
+    })?;
+    let build_project_result: RunShellCommandResult =
+        serde_json::from_value(build_project.result.clone())?;
+    assert!(build_project_result.exit_code.is_some());
+
+    Ok(())
+}
+
+#[test]
+fn tool_registry_checkpoint_and_undo_require_approval() -> Result<()> {
+    let dir = tempdir()?;
+    let registry = ToolRegistry::new(dir.path());
+
+    let checkpoint = registry.execute(grokcli::tools::registry::ToolCallRequest {
+        name: "checkpoint_repo".to_string(),
+        arguments: json!({ "approved": false }),
+    })?;
+    let checkpoint_result: CheckpointRepoResult =
+        serde_json::from_value(checkpoint.result.clone())?;
+    assert!(checkpoint_result.approval_required);
+
+    let undo = registry.execute(grokcli::tools::registry::ToolCallRequest {
+        name: "undo_last_patch".to_string(),
+        arguments: json!({ "approved": false }),
+    })?;
+    let undo_result: UndoLastPatchResult = serde_json::from_value(undo.result.clone())?;
+    assert!(undo_result.approval_required);
+
     Ok(())
 }

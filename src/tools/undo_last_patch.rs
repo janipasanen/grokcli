@@ -8,7 +8,7 @@ pub struct UndoLastPatchArgs {
     pub approved: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UndoLastPatchResult {
     pub approval_required: bool,
     pub undone: bool,

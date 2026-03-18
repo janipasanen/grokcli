@@ -64,3 +64,5 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 - 2026-03-18: Added integration test for streaming Responses tool-call loop with mock provider.
 - 2026-03-18: Added runtime notices for checkpoint/undo tools and persisted tool_notice events for safer UX.
 - 2026-03-18: Added CLI override for context budget (`--context-budget-bytes`) and help text.
+- 2026-03-18: Added integration tests for workflow tools and approval gates (run_tests/build_project/checkpoint/undo).
+- 2026-03-18: Added README with macOS build/install instructions.

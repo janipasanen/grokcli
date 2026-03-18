@@ -10,7 +10,7 @@ pub struct CheckpointRepoArgs {
     pub approved: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointRepoResult {
     pub approval_required: bool,
     pub created: bool,

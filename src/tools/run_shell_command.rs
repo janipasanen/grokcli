@@ -15,7 +15,7 @@ pub struct RunShellCommandArgs {
     pub approved: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunShellCommandResult {
     pub command: String,
     pub working_directory: String,
