@@ -5,7 +5,9 @@ use crate::provider::xai_client::XaiClient;
 use crate::tools::registry::{ToolCallRequest, ToolCallResult, ToolRegistry};
 use anyhow::Result;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::env;
+use std::io::{self, Write};
 
 pub struct AgentRuntime {
     cfg: AppConfig,
@@ -89,12 +91,25 @@ impl AgentRuntime {
 
         let repo_root = env::current_dir()?;
         let registry = ToolRegistry::new(&repo_root);
+        let mut approval_cache = HashSet::new();
         if self.cfg.api_mode.eq_ignore_ascii_case("chat_completions") {
-            self.run_chat_completions_loop(client, &session, &registry, prompt)
+            self.run_chat_completions_loop(
+                client,
+                &session,
+                &registry,
+                &mut approval_cache,
+                prompt,
+            )
                 .await?;
         } else {
             match self
-                .run_responses_loop(client, &session, &registry, prompt.clone())
+                .run_responses_loop(
+                    client,
+                    &session,
+                    &registry,
+                    &mut approval_cache,
+                    prompt.clone(),
+                )
                 .await
             {
                 Ok(()) => {}
@@ -103,8 +118,14 @@ impl AgentRuntime {
                         eprintln!(
                             "responses endpoint unavailable, falling back to /v1/chat/completions"
                         );
-                        self.run_chat_completions_loop(client, &session, &registry, prompt)
-                            .await?;
+                        self.run_chat_completions_loop(
+                            client,
+                            &session,
+                            &registry,
+                            &mut approval_cache,
+                            prompt,
+                        )
+                        .await?;
                     } else {
                         return Err(err);
                     }
@@ -139,6 +160,7 @@ impl AgentRuntime {
         client: &XaiClient,
         session: &SessionStore,
         registry: &ToolRegistry,
+        approval_cache: &mut HashSet<String>,
         prompt: String,
     ) -> Result<()> {
         let mut previous_response_id: Option<String> = None;
@@ -192,9 +214,16 @@ impl AgentRuntime {
                       "call_id": call.call_id
                     }),
                 )?;
-                let result = self
-                    .execute_with_approval(registry, &call.name, &call.arguments)?
-                    .0;
+                let Some(result) = self.execute_with_approval(
+                    registry,
+                    session,
+                    approval_cache,
+                    &call.name,
+                    &call.arguments,
+                )? else {
+                    eprintln!("tool '{}' was not approved; stopping.", call.name);
+                    return Ok(());
+                };
                 session.append(
                     "tool_result",
                     json!({
@@ -204,13 +233,6 @@ impl AgentRuntime {
                     }),
                 )?;
                 eprintln!("tool: {}", call.name);
-                if needs_approval_without_auto(&result.result, self.cfg.auto_approve) {
-                    eprintln!(
-                        "approval required for tool '{}' (rerun with --auto-approve to continue)",
-                        call.name
-                    );
-                    return Ok(());
-                }
                 outputs.push(json!({
                     "type": "function_call_output",
                     "call_id": call.call_id,
@@ -233,6 +255,7 @@ impl AgentRuntime {
         client: &XaiClient,
         session: &SessionStore,
         registry: &ToolRegistry,
+        approval_cache: &mut HashSet<String>,
         prompt: String,
     ) -> Result<()> {
         let mut messages = vec![json!({
@@ -300,9 +323,16 @@ impl AgentRuntime {
                       "call_id": call.call_id
                     }),
                 )?;
-                let result = self
-                    .execute_with_approval(registry, &call.name, &call.arguments)?
-                    .0;
+                let Some(result) = self.execute_with_approval(
+                    registry,
+                    session,
+                    approval_cache,
+                    &call.name,
+                    &call.arguments,
+                )? else {
+                    eprintln!("tool '{}' was not approved; stopping.", call.name);
+                    return Ok(());
+                };
                 session.append(
                     "tool_result",
                     json!({
@@ -312,13 +342,6 @@ impl AgentRuntime {
                     }),
                 )?;
                 eprintln!("tool: {}", call.name);
-                if needs_approval_without_auto(&result.result, self.cfg.auto_approve) {
-                    eprintln!(
-                        "approval required for tool '{}' (rerun with --auto-approve to continue)",
-                        call.name
-                    );
-                    return Ok(());
-                }
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": call.call_id,
@@ -333,29 +356,81 @@ impl AgentRuntime {
     fn execute_with_approval(
         &self,
         registry: &ToolRegistry,
+        session: &SessionStore,
+        approval_cache: &mut HashSet<String>,
         name: &str,
         args: &Value,
-    ) -> Result<(ToolCallResult, bool)> {
+    ) -> Result<Option<ToolCallResult>> {
         let first = registry.execute(ToolCallRequest {
             name: name.to_string(),
             arguments: args.clone(),
         })?;
-        if !self.cfg.auto_approve || !result_is_approval_required(&first.result) {
-            return Ok((first, false));
+        if !result_is_approval_required(&first.result) {
+            return Ok(Some(first));
         }
 
-        let mut approved_args = args.clone();
-        if let Some(map) = approved_args.as_object_mut() {
-            map.insert("approved".to_string(), json!(true));
-        } else {
-            approved_args = json!({ "approved": true });
+        let reason = approval_reason(&first.result);
+        let cache_key = approval_cache_key(name, args, reason.as_deref());
+        if let Some(key) = cache_key.as_ref() {
+            if approval_cache.contains(key) {
+                session.append(
+                    "approval_decision",
+                    json!({
+                        "tool": name,
+                        "approved": true,
+                        "source": "session_cache"
+                    }),
+                )?;
+                let approved_result = rerun_with_approved(registry, name, args)?;
+                return Ok(Some(approved_result));
+            }
         }
-        let second = registry.execute(ToolCallRequest {
-            name: name.to_string(),
-            arguments: approved_args,
-        })?;
-        Ok((second, true))
+        session.append(
+            "approval_request",
+            json!({
+                "tool": name,
+                "reason": reason,
+                "mode": if self.cfg.auto_approve { "auto" } else { "interactive" }
+            }),
+        )?;
+
+        let approved = if self.cfg.auto_approve {
+            true
+        } else {
+            prompt_user_approval(name, reason.as_deref())?
+        };
+
+        session.append(
+            "approval_decision",
+            json!({
+                "tool": name,
+                "approved": approved
+            }),
+        )?;
+        if !approved {
+            return Ok(None);
+        }
+        if let Some(key) = cache_key {
+            approval_cache.insert(key);
+        }
+
+        let second = rerun_with_approved(registry, name, args)?;
+        Ok(Some(second))
     }
+}
+
+fn rerun_with_approved(registry: &ToolRegistry, name: &str, args: &Value) -> Result<ToolCallResult> {
+    let mut approved_args = args.clone();
+    if let Some(map) = approved_args.as_object_mut() {
+        map.insert("approved".to_string(), json!(true));
+    } else {
+        approved_args = json!({ "approved": true });
+    }
+    let second = registry.execute(ToolCallRequest {
+        name: name.to_string(),
+        arguments: approved_args,
+    })?;
+    Ok(second)
 }
 
 #[derive(Debug, Clone)]
@@ -486,6 +561,52 @@ fn result_is_approval_required(result: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn needs_approval_without_auto(result: &Value, auto_approve: bool) -> bool {
-    !auto_approve && result_is_approval_required(result)
+fn approval_reason(result: &Value) -> Option<String> {
+    result
+        .get("decision_reason")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn prompt_user_approval(tool_name: &str, reason: Option<&str>) -> Result<bool> {
+    match reason {
+        Some(r) if !r.trim().is_empty() => {
+            eprintln!("approval required for tool '{}': {}", tool_name, r);
+        }
+        _ => {
+            eprintln!("approval required for tool '{}'", tool_name);
+        }
+    }
+    eprint!("Approve? [y/N]: ");
+    io::stderr().flush()?;
+
+    let mut line = String::new();
+    let bytes = io::stdin().read_line(&mut line)?;
+    if bytes == 0 {
+        return Ok(false);
+    }
+    let normalized = line.trim().to_ascii_lowercase();
+    Ok(normalized == "y" || normalized == "yes")
+}
+
+fn approval_cache_key(tool_name: &str, args: &Value, reason: Option<&str>) -> Option<String> {
+    if tool_name != "run_shell_command" {
+        return None;
+    }
+    let command = args.get("command").and_then(Value::as_str).unwrap_or_default();
+    let lower = command.to_ascii_lowercase();
+    let tier1_patterns = [
+        "cargo test",
+        "cargo fmt",
+        "cargo clippy",
+        "cargo build",
+        "swift build",
+        "swift test",
+        "swift format",
+    ];
+    if !tier1_patterns.iter().any(|p| lower.contains(p)) {
+        return None;
+    }
+    let reason_key = reason.unwrap_or("tier1");
+    Some(format!("{}::{}", tool_name, reason_key))
 }
