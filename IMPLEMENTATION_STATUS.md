@@ -24,7 +24,7 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 | 3 | xAI Responses API client with streaming | Completed | Added client for `https://api.x.ai/v1/responses` and SSE text streaming parser; added retry/backoff for JSON calls. |
 | 4 | Deterministic agent runtime loop skeleton | Completed | Upgraded to multi-step loop with provider response parsing, tool execution, and continuation via `previous_response_id`. |
 | 5 | Read-only tool registry | Completed | Added `read_file`, `list_directory`, `search_text`, plus published JSON tool definitions for provider calls. |
-| 6 | Shell tool with approval policy | Completed | Added policy tiers (`allow`/`require approval`/`block`) and `run_shell_command` tool scaffold; runtime supports `--auto-approve`. |
+| 6 | Shell tool with approval policy | Completed | Added policy tiers (`allow`/`require approval`/`block`) and `run_shell_command` tool scaffold; runtime supports `--auto-approve` and interactive/cached approvals. |
 | 7 | Git tools | Completed | Added `git_status` and `git_diff` tools and registry wiring. |
 | 8 | Session persistence | Completed | Added append-only JSONL session store and runtime logging for user/assistant turns. |
 | 9 | Patch proposal/apply | Completed | Added `apply_patch` tool with `git apply --check` validation and approval-gated apply. |
@@ -43,3 +43,5 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 - 2026-03-18: Added retry/backoff and improved provider error payloads for xAI JSON requests.
 - 2026-03-18: Added `--auto-approve` runtime behavior to re-run approval-gated tools with `approved=true`.
 - 2026-03-18: Live-verified approval gating flow (blocked without `--auto-approve`, succeeds with it).
+- 2026-03-18: Added interactive per-tool approval prompt and persisted approval request/decision events in session logs.
+- 2026-03-18: Added session-level "ask once" cache for Tier-1-style shell approvals (`cargo test/build/fmt/clippy`, `swift build/test/format`).
