@@ -158,7 +158,7 @@ impl ToolRegistry {
           {
             "type": "function",
             "name": "run_shell_command",
-            "description": "Run a shell command in the repository with policy checks. Prefer dedicated tools such as run_tests or build_project when they fit.",
+            "description": "Run a shell command in the repository with policy checks. Prefer dedicated tools such as run_tests or build_project when they fit. Do not use this tool to edit files; use apply_patch instead.",
             "parameters": {
               "type": "object",
               "properties": {

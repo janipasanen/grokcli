@@ -17,6 +17,19 @@ pub struct AgentRuntime {
     max_steps: u32,
 }
 
+#[derive(Debug, Clone, Default)]
+struct VerificationState {
+    last_failure: Option<VerificationFailure>,
+}
+
+#[derive(Debug, Clone)]
+struct VerificationFailure {
+    tool_name: String,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    blocked: bool,
+}
+
 impl AgentRuntime {
     pub fn new(cfg: AppConfig, max_steps: u32) -> Self {
         Self { cfg, max_steps }
@@ -211,6 +224,7 @@ impl AgentRuntime {
     ) -> Result<()> {
         let mut previous_response_id = resumed_previous_response_id;
         let mut budget = ContextBudgetManager::new(self.cfg.context_budget_bytes);
+        let mut verification = VerificationState::default();
         let instructions = build_multi_step_instructions(repo_root);
         let store = true;
         if !self.cfg.store {
@@ -285,6 +299,21 @@ impl AgentRuntime {
 
             let tool_calls = extract_tool_calls(&response);
             if tool_calls.is_empty() {
+                if let Some(reminder) = verification_followup_message(&verification) {
+                    eprintln!("{reminder}");
+                    session.append(
+                        "runtime_notice",
+                        json!({
+                            "kind": "verification_failed_continue",
+                            "message": reminder
+                        }),
+                    )?;
+                    pending_input = vec![json!({
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": reminder }]
+                    })];
+                    continue;
+                }
                 println!();
                 completed = true;
                 break;
@@ -292,14 +321,17 @@ impl AgentRuntime {
 
             let mut outputs = Vec::new();
             for call in tool_calls {
+                let action = describe_tool_call(&call.name, &call.arguments);
                 session.append(
                     "tool_call",
                     json!({
                       "name": call.name,
                       "arguments": call.arguments,
-                      "call_id": call.call_id
+                      "call_id": call.call_id,
+                      "action": action
                     }),
                 )?;
+                eprintln!("tool: {action}");
                 let Some(result) = self.execute_with_approval(
                     registry,
                     session,
@@ -319,6 +351,12 @@ impl AgentRuntime {
                     }),
                 )?;
                 emit_tool_notice(session, &call.name, &result.result)?;
+                update_verification_state(
+                    &mut verification,
+                    &call.name,
+                    &call.arguments,
+                    &result.result,
+                );
                 maybe_record_applied_patch(
                     &call.name,
                     &call.arguments,
@@ -326,7 +364,6 @@ impl AgentRuntime {
                     repo_root,
                     session.path(),
                 )?;
-                eprintln!("tool: {}", call.name);
                 let budgeted = budget.fit_tool_output(result.result.clone());
                 outputs.push(json!({
                     "type": "function_call_output",
@@ -369,6 +406,7 @@ impl AgentRuntime {
             }),
         ];
         let mut budget = ContextBudgetManager::new(self.cfg.context_budget_bytes);
+        let mut verification = VerificationState::default();
         let mut completed = false;
 
         for step in 0..self.max_steps {
@@ -418,20 +456,38 @@ impl AgentRuntime {
 
             let tool_calls = extract_chat_tool_calls(message);
             if tool_calls.is_empty() {
+                if let Some(reminder) = verification_followup_message(&verification) {
+                    eprintln!("{reminder}");
+                    session.append(
+                        "runtime_notice",
+                        json!({
+                            "kind": "verification_failed_continue",
+                            "message": reminder
+                        }),
+                    )?;
+                    messages.push(json!({
+                        "role": "user",
+                        "content": reminder
+                    }));
+                    continue;
+                }
                 println!();
                 completed = true;
                 break;
             }
 
             for call in tool_calls {
+                let action = describe_tool_call(&call.name, &call.arguments);
                 session.append(
                     "tool_call",
                     json!({
                       "name": call.name,
                       "arguments": call.arguments,
-                      "call_id": call.call_id
+                      "call_id": call.call_id,
+                      "action": action
                     }),
                 )?;
+                eprintln!("tool: {action}");
                 let Some(result) = self.execute_with_approval(
                     registry,
                     session,
@@ -451,6 +507,12 @@ impl AgentRuntime {
                     }),
                 )?;
                 emit_tool_notice(session, &call.name, &result.result)?;
+                update_verification_state(
+                    &mut verification,
+                    &call.name,
+                    &call.arguments,
+                    &result.result,
+                );
                 maybe_record_applied_patch(
                     &call.name,
                     &call.arguments,
@@ -458,7 +520,6 @@ impl AgentRuntime {
                     repo_root,
                     session.path(),
                 )?;
-                eprintln!("tool: {}", call.name);
                 let budgeted = budget.fit_tool_output(result.result.clone());
                 messages.push(json!({
                     "role": "tool",
@@ -483,6 +544,7 @@ impl AgentRuntime {
         name: &str,
         args: &Value,
     ) -> Result<Option<ToolCallResult>> {
+        let action = describe_tool_call(name, args);
         let first = registry.execute(ToolCallRequest {
             name: name.to_string(),
             arguments: args.clone(),
@@ -516,6 +578,7 @@ impl AgentRuntime {
             "approval_request",
             json!({
                 "tool": name,
+                "action": action,
                 "reason": reason,
                 "mode": if self.cfg.auto_approve { "auto" } else { "interactive" }
             }),
@@ -524,7 +587,7 @@ impl AgentRuntime {
         let approved = if self.cfg.auto_approve {
             true
         } else {
-            prompt_user_approval(name, reason.as_deref())?
+            prompt_user_approval(&action, reason.as_deref())?
         };
 
         session.append(
@@ -695,13 +758,13 @@ fn approval_reason(result: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn prompt_user_approval(tool_name: &str, reason: Option<&str>) -> Result<bool> {
+fn prompt_user_approval(action: &str, reason: Option<&str>) -> Result<bool> {
     match reason {
         Some(r) if !r.trim().is_empty() => {
-            eprintln!("approval required for tool '{}': {}", tool_name, r);
+            eprintln!("approval required for {action}: {r}");
         }
         _ => {
-            eprintln!("approval required for tool '{}'", tool_name);
+            eprintln!("approval required for {action}");
         }
     }
     eprint!("Approve? [y/N]: ");
@@ -727,6 +790,211 @@ fn render_patch_preview(patch: &str) {
         }
         eprintln!("{line}");
         count += 1;
+    }
+}
+
+fn describe_tool_call(tool_name: &str, args: &Value) -> String {
+    match tool_name {
+        "read_file" => {
+            let path = string_arg(args, "path").unwrap_or("?");
+            format!("read_file path={path:?}")
+        }
+        "list_directory" => {
+            let path = string_arg(args, "path").unwrap_or(".");
+            format!("list_directory path={path:?}")
+        }
+        "search_text" => {
+            let pattern = string_arg(args, "pattern").unwrap_or("?");
+            match string_arg(args, "path") {
+                Some(path) => format!("search_text pattern={pattern:?} path={path:?}"),
+                None => format!("search_text pattern={pattern:?}"),
+            }
+        }
+        "run_shell_command" => describe_shell_tool(args),
+        "run_tests" => describe_wrapper_tool("run_tests", args, wrapper_command("run_tests", args)),
+        "build_project" => {
+            describe_wrapper_tool("build_project", args, wrapper_command("build_project", args))
+        }
+        "run_linter" => describe_wrapper_tool("run_linter", args, wrapper_command("run_linter", args)),
+        "run_formatter" => {
+            describe_wrapper_tool("run_formatter", args, wrapper_command("run_formatter", args))
+        }
+        "apply_patch" => describe_apply_patch(args),
+        "git_status" => "git_status".to_string(),
+        "git_diff" => {
+            let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
+            format!("git_diff staged={staged}")
+        }
+        "checkpoint_repo" => "checkpoint_repo create repo diff checkpoint".to_string(),
+        "undo_last_patch" => "undo_last_patch reverse latest recorded patch".to_string(),
+        _ => tool_name.to_string(),
+    }
+}
+
+fn describe_shell_tool(args: &Value) -> String {
+    let command = string_arg(args, "command").unwrap_or("?");
+    let cwd = string_arg(args, "working_directory").unwrap_or(".");
+    match args.get("timeout_seconds").and_then(Value::as_u64) {
+        Some(timeout) => {
+            format!("run_shell_command command={command:?} cwd={cwd:?} timeout={}s", timeout)
+        }
+        None => format!("run_shell_command command={command:?} cwd={cwd:?}"),
+    }
+}
+
+fn describe_wrapper_tool(tool_name: &str, args: &Value, command: String) -> String {
+    let language = string_arg(args, "language").unwrap_or(match tool_name {
+        "run_tests" | "build_project" | "run_linter" | "run_formatter" => "rust",
+        _ => "?",
+    });
+    format!("{tool_name} language={language:?} command={command:?}")
+}
+
+fn wrapper_command(tool_name: &str, args: &Value) -> String {
+    let language = string_arg(args, "language").unwrap_or("rust");
+    let is_swift = language.eq_ignore_ascii_case("swift");
+    match tool_name {
+        "run_tests" => {
+            if is_swift {
+                "swift test".to_string()
+            } else {
+                "cargo test".to_string()
+            }
+        }
+        "build_project" => {
+            if is_swift {
+                "swift build".to_string()
+            } else {
+                "cargo build".to_string()
+            }
+        }
+        "run_linter" => {
+            if is_swift {
+                "swift format lint".to_string()
+            } else {
+                "cargo clippy".to_string()
+            }
+        }
+        "run_formatter" => {
+            if is_swift {
+                "swift format .".to_string()
+            } else {
+                "cargo fmt".to_string()
+            }
+        }
+        _ => "?".to_string(),
+    }
+}
+
+fn describe_apply_patch(args: &Value) -> String {
+    let patch = string_arg(args, "patch").unwrap_or_default();
+    let files = patch_files_from_unified_diff(patch);
+    let line_count = patch.lines().count();
+    if files.is_empty() {
+        format!("apply_patch lines={line_count}")
+    } else {
+        format!("apply_patch files={files:?} lines={line_count}")
+    }
+}
+
+fn patch_files_from_unified_diff(patch: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for line in patch.lines() {
+        let candidate = if let Some(rest) = line.strip_prefix("+++ b/") {
+            Some(rest)
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            if rest == "/dev/null" {
+                None
+            } else {
+                Some(rest)
+            }
+        } else {
+            None
+        };
+        if let Some(path) = candidate {
+            if !files.iter().any(|existing| existing == path) {
+                files.push(path.to_string());
+            }
+        }
+    }
+    files
+}
+
+fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key).and_then(Value::as_str)
+}
+
+fn update_verification_state(
+    state: &mut VerificationState,
+    tool_name: &str,
+    args: &Value,
+    result: &Value,
+) {
+    if !is_verification_tool(tool_name, args) {
+        return;
+    }
+
+    let blocked = result.get("blocked").and_then(Value::as_bool).unwrap_or(false);
+    let timed_out = result
+        .get("timed_out")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let exit_code = result
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .map(|v| v as i32);
+
+    if !blocked && !timed_out && exit_code == Some(0) {
+        state.last_failure = None;
+        return;
+    }
+
+    state.last_failure = Some(VerificationFailure {
+        tool_name: verification_tool_name(tool_name, args),
+        exit_code,
+        timed_out,
+        blocked,
+    });
+}
+
+fn verification_followup_message(state: &VerificationState) -> Option<String> {
+    let failure = state.last_failure.as_ref()?;
+    let status = if failure.blocked {
+        "was blocked".to_string()
+    } else if failure.timed_out {
+        "timed out".to_string()
+    } else if let Some(code) = failure.exit_code {
+        format!("exited with code {code}")
+    } else {
+        "did not succeed".to_string()
+    };
+
+    Some(format!(
+        "The last verification step `{}` {}. Do not claim success yet. Continue using tools until build/tests pass, or explain the concrete blocker.",
+        failure.tool_name, status
+    ))
+}
+
+fn is_verification_tool(tool_name: &str, args: &Value) -> bool {
+    match tool_name {
+        "run_tests" | "build_project" => true,
+        "run_shell_command" => {
+            let command = string_arg(args, "command").unwrap_or_default().to_ascii_lowercase();
+            command.contains("cargo test")
+                || command.contains("swift test")
+                || command.contains("cargo build")
+                || command.contains("swift build")
+        }
+        _ => false,
+    }
+}
+
+fn verification_tool_name(tool_name: &str, args: &Value) -> String {
+    match tool_name {
+        "run_shell_command" => string_arg(args, "command")
+            .map(ToString::to_string)
+            .unwrap_or_else(|| tool_name.to_string()),
+        _ => tool_name.to_string(),
     }
 }
 
@@ -848,4 +1116,85 @@ fn emit_max_steps_notice(session: &SessionStore, max_steps: u32) -> Result<()> {
         }),
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn describe_run_shell_command_includes_command_and_cwd() {
+        let description = describe_tool_call(
+            "run_shell_command",
+            &json!({
+                "command": "swift test",
+                "working_directory": "Tests",
+                "timeout_seconds": 600
+            }),
+        );
+        assert_eq!(
+            description,
+            "run_shell_command command=\"swift test\" cwd=\"Tests\" timeout=600s"
+        );
+    }
+
+    #[test]
+    fn describe_run_tests_infers_underlying_command() {
+        let description = describe_tool_call("run_tests", &json!({ "language": "swift" }));
+        assert_eq!(
+            description,
+            "run_tests language=\"swift\" command=\"swift test\""
+        );
+    }
+
+    #[test]
+    fn describe_apply_patch_lists_files() {
+        let patch = "\
+diff --git a/Tests/AppTests/File.swift b/Tests/AppTests/File.swift
+--- a/Tests/AppTests/File.swift
++++ b/Tests/AppTests/File.swift
+@@ -1 +1 @@
+-old
++new
+";
+        let description = describe_tool_call("apply_patch", &json!({ "patch": patch }));
+        assert!(
+            description.contains("Tests/AppTests/File.swift"),
+            "description should include patched file"
+        );
+        assert!(description.contains("lines="), "description should include line count");
+    }
+
+    #[test]
+    fn verification_followup_message_reports_failed_run_tests() {
+        let mut state = VerificationState::default();
+        update_verification_state(
+            &mut state,
+            "run_tests",
+            &json!({ "language": "swift" }),
+            &json!({ "exit_code": 1, "timed_out": false, "blocked": false }),
+        );
+        let message = verification_followup_message(&state).expect("message");
+        assert!(message.contains("run_tests"));
+        assert!(message.contains("exited with code 1"));
+        assert!(message.contains("Do not claim success yet"));
+    }
+
+    #[test]
+    fn verification_state_clears_after_success() {
+        let mut state = VerificationState::default();
+        update_verification_state(
+            &mut state,
+            "run_tests",
+            &json!({ "language": "swift" }),
+            &json!({ "exit_code": 1, "timed_out": false, "blocked": false }),
+        );
+        update_verification_state(
+            &mut state,
+            "run_tests",
+            &json!({ "language": "swift" }),
+            &json!({ "exit_code": 0, "timed_out": false, "blocked": false }),
+        );
+        assert!(verification_followup_message(&state).is_none());
+    }
 }

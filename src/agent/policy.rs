@@ -26,6 +26,16 @@ pub fn evaluate_command(command: &str, cwd: &Path, repo_root: &Path) -> CommandP
         }
     }
 
+    for blocked in ["sed -i", "perl -i", "perl -pi", "ruby -i", "ruby -pi"] {
+        if lower.contains(blocked) {
+            return CommandPolicyDecision::Block {
+                reason: format!(
+                    "shell-based file editing is blocked by policy ({blocked}); use apply_patch instead"
+                ),
+            };
+        }
+    }
+
     for approval in [
         "cargo test",
         "cargo fmt",
@@ -58,4 +68,22 @@ pub fn evaluate_command(command: &str, cwd: &Path, repo_root: &Path) -> CommandP
 
 fn normalize_or(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn blocks_in_place_shell_edits() {
+        let dir = tempdir().expect("tempdir");
+        let decision = evaluate_command("sed -i '' 's/a/b/' file.swift", dir.path(), dir.path());
+        match decision {
+            CommandPolicyDecision::Block { reason } => {
+                assert!(reason.contains("use apply_patch instead"));
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
 }

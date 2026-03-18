@@ -141,7 +141,8 @@ impl XaiClient {
             let mut buffer = String::new();
             let mut final_response: Option<Value> = None;
             while let Some(chunk_result) = stream.next().await {
-                let chunk = chunk_result.context("failed to read streaming response chunk")?;
+                let chunk = chunk_result
+                    .map_err(|err| anyhow!("failed to read streaming response chunk: {err}"))?;
                 let text = String::from_utf8_lossy(&chunk);
                 buffer.push_str(&text);
 
@@ -208,7 +209,8 @@ impl XaiClient {
         let mut collected = String::new();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.context("failed to read streaming response chunk")?;
+            let chunk = chunk_result
+                .map_err(|err| anyhow!("failed to read streaming response chunk: {err}"))?;
             let text = String::from_utf8_lossy(&chunk);
             buffer.push_str(&text);
 
