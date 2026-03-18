@@ -20,8 +20,25 @@ impl AgentRuntime {
         Self { cfg, max_steps }
     }
 
-    pub async fn run_ask(&self, client: &XaiClient, prompt: String) -> Result<()> {
-        let session = SessionStore::for_new_session()?;
+    pub async fn run_ask(
+        &self,
+        client: &XaiClient,
+        prompt: String,
+        resume_session: Option<SessionStore>,
+    ) -> Result<()> {
+        let session = match resume_session {
+            Some(existing) => existing,
+            None => SessionStore::for_new_session()?,
+        };
+        let resumed_previous_response_id = session.last_provider_response_id()?;
+        if resumed_previous_response_id.is_some() {
+            session.append(
+                "resume",
+                json!({
+                    "previous_response_id": resumed_previous_response_id
+                }),
+            )?;
+        }
         session.append("user_message", SessionStore::prompt_payload(&prompt))?;
 
         if self.max_steps <= 1 {
@@ -111,6 +128,7 @@ impl AgentRuntime {
                     &registry,
                     &repo_root,
                     &mut approval_cache,
+                    resumed_previous_response_id.clone(),
                     prompt.clone(),
                 )
                 .await
@@ -166,9 +184,10 @@ impl AgentRuntime {
         registry: &ToolRegistry,
         repo_root: &std::path::Path,
         approval_cache: &mut HashSet<String>,
+        resumed_previous_response_id: Option<String>,
         prompt: String,
     ) -> Result<()> {
-        let mut previous_response_id: Option<String> = None;
+        let mut previous_response_id = resumed_previous_response_id;
         let mut pending_input = vec![json!({
             "role": "user",
             "content": [{ "type": "input_text", "text": prompt }]

@@ -8,6 +8,7 @@ mod workflows;
 use crate::agent::runtime::AgentRuntime;
 use crate::config::config::AppConfig;
 use crate::persistence::patch_store::PatchStore;
+use crate::persistence::session_store::{SessionStore, latest_session_path, resolve_session_path};
 use crate::workflows::presets::{WorkflowPreset, apply_preset_prompt};
 use crate::provider::xai_client::XaiClient;
 use anyhow::Result;
@@ -29,6 +30,10 @@ struct Cli {
     auto_approve: bool,
     #[arg(long)]
     undo_last_patch: bool,
+    #[arg(long)]
+    resume_session: Option<String>,
+    #[arg(long)]
+    resume_latest: bool,
     #[arg(long, value_enum)]
     preset: Option<WorkflowPreset>,
     #[arg(long, default_value_t = 8)]
@@ -69,7 +74,18 @@ async fn main() -> Result<()> {
         Some(preset) => apply_preset_prompt(&preset, &base_prompt),
         None => base_prompt,
     };
-    runtime.run_ask(&client, prompt).await?;
+    let resume_store = if cli.resume_latest {
+        match latest_session_path()? {
+            Some(path) => Some(SessionStore::open_existing(path)?),
+            None => None,
+        }
+    } else if let Some(spec) = cli.resume_session {
+        let path = resolve_session_path(&spec)?;
+        Some(SessionStore::open_existing(path)?)
+    } else {
+        None
+    };
+    runtime.run_ask(&client, prompt, resume_store).await?;
 
     Ok(())
 }

@@ -26,7 +26,7 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 | 5 | Read-only tool registry | Completed | Added `read_file`, `list_directory`, `search_text`, plus published JSON tool definitions for provider calls. |
 | 6 | Shell tool with approval policy | Completed | Added policy tiers (`allow`/`require approval`/`block`) and `run_shell_command` tool scaffold; runtime supports `--auto-approve` and interactive/cached approvals. |
 | 7 | Git tools | Completed | Added `git_status` and `git_diff` tools and registry wiring. |
-| 8 | Session persistence | Completed | Added append-only JSONL session store and runtime logging for user/assistant turns. |
+| 8 | Session persistence | Completed | Added append-only JSONL session store, runtime logging for user/assistant/provider/tool events, and resume helpers. |
 | 9 | Patch proposal/apply | Completed | Added `apply_patch` tool with `git apply --check` validation, approval-gated apply, patch history persistence, and CLI undo via `--undo-last-patch`. |
 | 10 | Rust/Swift workflow presets | Completed | Added `--preset` CLI option with `rust-tests`, `swift-build`, and `review-changed` prompt shaping. |
 
@@ -47,3 +47,4 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 - 2026-03-18: Added session-level "ask once" cache for Tier-1-style shell approvals (`cargo test/build/fmt/clippy`, `swift build/test/format`).
 - 2026-03-18: Added patch history store (`~/.local/share/grok-agent/patches.jsonl`) and implemented `--undo-last-patch`.
 - 2026-03-18: Verified undo path end-to-end against a recorded patch (reverse apply succeeded).
+- 2026-03-18: Added session resume support (`--resume-session <id|path>` and `--resume-latest`) with prior `previous_response_id` continuation for Responses mode.
