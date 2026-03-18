@@ -132,7 +132,7 @@ fn codex_patch_to_unified_diff(patch: &str) -> std::result::Result<String, Strin
                 if next.starts_with("*** ") {
                     break;
                 }
-                section.push(next.to_string());
+                section.push(normalize_hunk_line(next));
                 let _ = lines.next();
             }
             if section.is_empty() {
@@ -156,12 +156,7 @@ fn codex_patch_to_unified_diff(patch: &str) -> std::result::Result<String, Strin
                 if next.starts_with("*** ") {
                     break;
                 }
-                if !next.starts_with('+') {
-                    return Err(format!(
-                        "invalid Codex add-file format for `{path}`: expected lines starting with `+`"
-                    ));
-                }
-                section.push(next.to_string());
+                section.push(normalize_add_file_line(next));
                 let _ = lines.next();
             }
             let additions = section.len();
@@ -329,6 +324,28 @@ fn count_hunk_lines(lines: &[String]) -> (usize, usize) {
     (old_count, new_count)
 }
 
+fn normalize_hunk_line(line: &str) -> String {
+    if line.starts_with("\\ No newline at end of file") {
+        return line.to_string();
+    }
+    match line.chars().next() {
+        Some(' ') | Some('+') | Some('-') | Some('@') => line.to_string(),
+        _ => format!(" {line}"),
+    }
+}
+
+fn normalize_add_file_line(line: &str) -> String {
+    if line.starts_with("\\ No newline at end of file") {
+        return line.to_string();
+    }
+    match line.chars().next() {
+        Some('+') => line.to_string(),
+        Some(' ') => format!("+{}", &line[1..]),
+        Some('-') => format!("+{}", &line[1..]),
+        _ => format!("+{line}"),
+    }
+}
+
 fn hunk_range(start: usize, count: usize) -> String {
     match count {
         0 => format!("{start},0"),
@@ -492,6 +509,38 @@ diff --git a/demo.txt b/demo.txt
         assert!(result.valid, "{}", result.check_stderr);
         assert!(result.applied, "{}", result.apply_stderr);
         assert_eq!(fs::read_to_string(dir.path().join("demo.txt"))?, "new\n");
+        Ok(())
+    }
+
+    #[test]
+    fn converts_codex_update_patch_with_unprefixed_lines() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("demo.txt"), "old\n")?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+*** Begin Patch
+*** Update File: demo.txt
+old
+new
+*** End Patch
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(
+            !result.valid || !result.applied,
+            "unprefixed full-replacement patch should not silently produce an unsafe rewrite"
+        );
         Ok(())
     }
 }
