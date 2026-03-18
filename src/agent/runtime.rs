@@ -5,7 +5,7 @@ use crate::persistence::session_store::SessionStore;
 use crate::provider::models::build_simple_request;
 use crate::provider::LanguageModelProvider;
 use crate::tools::registry::{ToolCallRequest, ToolCallResult, ToolRegistry};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::env;
@@ -27,6 +27,7 @@ impl AgentRuntime {
         prompt: String,
         resume_session: Option<SessionStore>,
     ) -> Result<()> {
+        validate_model_configuration(&self.cfg)?;
         let session = match resume_session {
             Some(existing) => existing,
             None => SessionStore::for_new_session()?,
@@ -177,6 +178,17 @@ fn normalize_model_name(model: &str) -> String {
     }
 }
 
+fn validate_model_configuration(cfg: &AppConfig) -> Result<()> {
+    let model = normalize_model_name(&cfg.model);
+    if model.contains("multi-agent") {
+        bail!(
+            "{} is not compatible with this CLI's client-side tool architecture; use grok-code-fast-1, grok-4-1-fast-reasoning, grok-4-1-fast-non-reasoning, grok-4.20-beta-0309-reasoning, or grok-4.20-beta-0309-non-reasoning",
+            model
+        );
+    }
+    Ok(())
+}
+
 impl AgentRuntime {
     async fn run_responses_loop(
         &self,
@@ -190,6 +202,12 @@ impl AgentRuntime {
     ) -> Result<()> {
         let mut previous_response_id = resumed_previous_response_id;
         let mut budget = ContextBudgetManager::new(self.cfg.context_budget_bytes);
+        let store = true;
+        if !self.cfg.store {
+            eprintln!(
+                "forcing store=true for multi-step Responses mode so previous_response_id works"
+            );
+        }
         let mut pending_input = vec![json!({
             "role": "user",
             "content": [{ "type": "input_text", "text": prompt }]
@@ -200,23 +218,31 @@ impl AgentRuntime {
                 "model": normalize_model_name(&self.cfg.model),
                 "input": pending_input,
                 "tools": registry.definitions_json(),
-                "stream": false,
+                "stream": self.cfg.stream,
                 "parallel_tool_calls": self.cfg.parallel_tool_calls,
-                "store": self.cfg.store,
+                "store": store,
                 "max_output_tokens": self.cfg.max_output_tokens,
                 "temperature": self.cfg.temperature,
                 "previous_response_id": previous_response_id
             });
 
+            let mut streamed = false;
             let response = if self.cfg.stream {
                 match client.create_response_stream_json(&body).await {
-                    Ok(value) => value,
+                    Ok(value) => {
+                        streamed = true;
+                        value
+                    }
                     Err(err) => {
                         eprintln!(
                             "streaming failed, falling back to non-streaming: {}",
                             err
                         );
-                        client.create_response_json(&body).await?
+                        let mut fallback_body = body.clone();
+                        if let Some(obj) = fallback_body.as_object_mut() {
+                            obj.insert("stream".to_string(), json!(false));
+                        }
+                        client.create_response_json(&fallback_body).await?
                     }
                 }
             } else {
@@ -230,10 +256,12 @@ impl AgentRuntime {
 
             let text = extract_text(&response);
             if !text.trim().is_empty() {
-                if step > 0 {
+                if step > 0 && !streamed {
                     println!();
                 }
-                print!("{text}");
+                if !streamed {
+                    print!("{text}");
+                }
                 session.append("assistant_message", SessionStore::assistant_payload(&text))?;
             }
 

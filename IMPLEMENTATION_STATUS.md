@@ -66,3 +66,7 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 - 2026-03-18: Added CLI override for context budget (`--context-budget-bytes`) and help text.
 - 2026-03-18: Added integration tests for workflow tools and approval gates (run_tests/build_project/checkpoint/undo).
 - 2026-03-18: Added README with macOS build/install instructions.
+- 2026-03-18: Fixed agentic Responses continuation by forcing stored state for multi-step loops; confirmed `store=false` breaks `previous_response_id`.
+- 2026-03-18: Fixed the Responses streaming loop to send `stream=true` on the wire and stop duplicating final streamed text.
+- 2026-03-18: Live-verified agentic tool-calling with `grok-code-fast-1`, `grok-4-1-fast-reasoning`, `grok-4-1-fast-non-reasoning`, `grok-4.20-beta-0309-reasoning`, and `grok-4.20-beta-0309-non-reasoning`.
+- 2026-03-18: Added preflight rejection for `grok-4.20-multi-agent-beta-0309` because xAI rejects client-side tools for that model.

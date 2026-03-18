@@ -189,6 +189,36 @@ async fn runtime_streaming_responses_executes_tool() -> Result<()> {
     assert!(requests.len() >= 2, "expected at least two provider calls");
     let first = &requests[0];
     assert!(first.get("input").is_some(), "responses request should include input");
+    assert_eq!(first.get("store").and_then(Value::as_bool), Some(true));
+    assert_eq!(first.get("stream").and_then(Value::as_bool), Some(true));
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_forces_store_true_for_multi_step_responses() -> Result<()> {
+    let dir = tempdir()?;
+    unsafe {
+        std::env::set_var("HOME", dir.path());
+    }
+    std::env::set_current_dir(dir.path())?;
+    std::fs::write(dir.path().join("alpha.txt"), "alpha")?;
+
+    let provider = MockProvider::new(
+        vec![responses_final_response()],
+        vec![responses_tool_call_response()],
+    );
+    let mut cfg = AppConfig::default();
+    cfg.api_mode = "responses".to_string();
+    cfg.stream = false;
+    cfg.store = false;
+    let runtime = AgentRuntime::new(cfg, 3);
+    runtime
+        .run_ask(&provider, "list files".to_string(), None)
+        .await?;
+
+    let requests = provider.recorded_requests();
+    let first = &requests[0];
+    assert_eq!(first.get("store").and_then(Value::as_bool), Some(true));
     Ok(())
 }
 

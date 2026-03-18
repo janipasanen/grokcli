@@ -2,6 +2,23 @@
 
 Terminal-native Grok agent scaffold built around xAI's API.
 
+## Recommended model
+
+For this CLI's client-side agentic workflow, use:
+
+```bash
+grok-code-fast-1
+```
+
+Other verified working choices:
+
+- `grok-4-1-fast-reasoning`
+- `grok-4-1-fast-non-reasoning`
+- `grok-4.20-beta-0309-reasoning`
+- `grok-4.20-beta-0309-non-reasoning`
+
+Do not use `grok-4.20-multi-agent-beta-0309` with this CLI. That model is for xAI-managed multi-agent/server-side workflows and rejects this tool's client-side function-calling architecture.
+
 ## Build (macOS)
 
 ```bash

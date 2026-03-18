@@ -83,7 +83,7 @@ fn default_provider() -> String {
 }
 
 fn default_model() -> String {
-    "grok-4.1-fast-reasoning".to_string()
+    "grok-code-fast-1".to_string()
 }
 
 fn default_base_url() -> String {
@@ -107,7 +107,7 @@ fn default_parallel_tool_calls() -> bool {
 }
 
 fn default_store() -> bool {
-    false
+    true
 }
 
 fn default_timeout_seconds() -> u64 {
