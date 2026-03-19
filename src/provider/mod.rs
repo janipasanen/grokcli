@@ -1,3 +1,4 @@
+pub mod agent_tools;
 pub mod models;
 pub mod xai_client;
 

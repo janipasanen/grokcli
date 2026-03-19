@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponsesRequest {
@@ -6,6 +7,8 @@ pub struct ResponsesRequest {
     pub input: Vec<InputMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Value>>,
     pub stream: bool,
     pub parallel_tool_calls: bool,
     pub store: bool,
@@ -50,6 +53,7 @@ pub fn build_simple_request(
     store: bool,
     max_output_tokens: u32,
     temperature: f32,
+    tools: Option<Vec<Value>>,
 ) -> ResponsesRequest {
     ResponsesRequest {
         model,
@@ -61,10 +65,32 @@ pub fn build_simple_request(
             }],
         }],
         instructions: None,
+        tools,
         stream,
         parallel_tool_calls,
         store,
         max_output_tokens,
         temperature,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_simple_request_defaults_to_no_tools() {
+        let request = build_simple_request(
+            "grok-code-fast-1".to_string(),
+            "hello".to_string(),
+            true,
+            false,
+            true,
+            4000,
+            0.1,
+            None,
+        );
+
+        assert!(request.tools.is_none());
     }
 }

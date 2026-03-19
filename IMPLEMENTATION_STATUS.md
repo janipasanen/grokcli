@@ -14,6 +14,7 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 8. Session persistence (JSONL session log)
 9. Patch proposal/apply path with approval gating
 10. Rust/Swift workflow preset commands
+11. xAI Agent Tools support in Responses mode
 
 ## Task Status
 
@@ -29,6 +30,7 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 | 8 | Session persistence | Completed | Added append-only JSONL session store, runtime logging for user/assistant/provider/tool events, and resume helpers. |
 | 9 | Patch proposal/apply | Completed | Added `apply_patch` tool with `git apply --check` validation, approval-gated apply, patch history persistence, and CLI undo via `--undo-last-patch`. |
 | 10 | Rust/Swift workflow presets | Completed | Added `--preset` CLI option with `rust-tests`, `swift-build`, and `review-changed` prompt shaping. |
+| 11 | xAI Agent Tools support in Responses mode | Completed | Added built-in `web_search` + `x_search` by default, optional `code_interpreter`, request wiring for typed and JSON Responses calls, CLI/config flags, and regression coverage. |
 
 ## Progress Log
 
@@ -82,3 +84,5 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 - 2026-03-18: Tidied verbose CLI rendering so tool activity prints as compact `tool>` / `tool<` lines with short status words (`ok`, `failed`, `applied`, `approval-required`) instead of long boolean dumps; stderr/stdout blocks remain visible when relevant.
 - 2026-03-18: Changed `verbose_tools` so concise `tool>` / `tool<` progress lines always print, while `--verbose-tools` or `/verbose-tools on` additionally enables detailed result previews; added repeated `--queue <prompt>` support so non-interactive runs can batch follow-up tasks into the same session.
 - 2026-03-18: Reworked the TTY interactive shell so pressing Enter submits the prompt into a background queue and immediately returns control to the prompt; queued tasks now print through `rustyline`'s external printer so new prompts can be entered while work is running, and approval requests from queued work can be answered with `/approve yes|no`.
+- 2026-03-19: Added xAI Agent Tools support for Responses mode, wiring built-in `web_search` and `x_search` by default plus opt-in `code_interpreter`, while preserving the local audited function-tool loop and chat-completions fallback behavior.
+- 2026-03-19: Added model-aware promotion for xAI built-in tools so `grok-code-fast-1` automatically upgrades that run to `grok-4-1-fast-reasoning` instead of failing with the Responses API's grok-4-only server-tool restriction.

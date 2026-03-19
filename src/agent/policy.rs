@@ -57,9 +57,14 @@ pub fn evaluate_command(command: &str, cwd: &Path, repo_root: &Path) -> CommandP
         }
     }
 
-    if lower.contains(" > ") || lower.contains(">>") {
-        return CommandPolicyDecision::RequireApproval {
-            reason: "shell redirection requires approval".to_string(),
+    if lower.contains(" > ")
+        || lower.contains(">>")
+        || lower.contains("<<")
+        || lower.contains("1>")
+        || lower.contains("2>")
+    {
+        return CommandPolicyDecision::Block {
+            reason: "shell-based file editing is blocked by policy (shell redirection/heredoc); use apply_patch instead".to_string(),
         };
     }
 
@@ -82,6 +87,30 @@ mod tests {
         match decision {
             CommandPolicyDecision::Block { reason } => {
                 assert!(reason.contains("use apply_patch instead"));
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blocks_redirection_edits() {
+        let dir = tempdir().expect("tempdir");
+        let decision = evaluate_command("cat > docs/status.md << 'EOF'\nhello\nEOF", dir.path(), dir.path());
+        match decision {
+            CommandPolicyDecision::Block { reason } => {
+                assert!(reason.contains("use apply_patch instead"));
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blocks_output_redirection_patterns() {
+        let dir = tempdir().expect("tempdir");
+        let decision = evaluate_command("echo hi > file.txt", dir.path(), dir.path());
+        match decision {
+            CommandPolicyDecision::Block { reason } => {
+                assert!(reason.contains("shell redirection/heredoc"));
             }
             other => panic!("expected Block, got {other:?}"),
         }

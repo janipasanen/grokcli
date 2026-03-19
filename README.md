@@ -189,6 +189,40 @@ grokcli --resume-latest "continue"
 grokcli --undo-last-patch
 ```
 
+### xAI Agent Tools
+
+In `responses` mode, `grokcli` now sends xAI's built-in Agent Tools alongside the local audited function tools:
+
+- `web_search` is enabled by default.
+- `x_search` is enabled by default.
+- `code_interpreter` is available as an opt-in.
+
+This keeps repository editing/build/test actions local and auditable while allowing xAI-managed search/code tools when the model needs them.
+If the selected model does not support xAI server-side tools, `grokcli` automatically switches that run to `grok-4-1-fast-reasoning` so Agent Tools still work. This matters for the default coding model `grok-code-fast-1`, which remains the default config value but is promoted to a Grok-4 model when built-in xAI tools are enabled in `responses` mode.
+
+Useful flags:
+
+```bash
+# Disable built-in web search for one run
+grokcli --no-xai-web-search "summarize this repo without web search"
+
+# Disable both search tools
+grokcli --no-xai-web-search --no-xai-x-search "stay strictly local"
+
+# Opt into xAI code interpreter in Responses mode
+grokcli --xai-code-interpreter "analyze this CSV and summarize anomalies"
+```
+
+Config file keys in `~/.config/grok-agent/config.toml`:
+
+```toml
+xai_web_search = true
+xai_x_search = true
+xai_code_interpreter = false
+```
+
+These built-in tools are only attached in `responses` mode. The legacy `chat-completions` fallback keeps using the local client-side tool loop only.
+
 ## Development
 
 Run the test suite:

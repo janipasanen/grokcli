@@ -32,6 +32,12 @@ pub struct AppConfig {
     pub verbose_tools: bool,
     #[serde(default = "default_context_budget_bytes")]
     pub context_budget_bytes: usize,
+    #[serde(default = "default_xai_web_search")]
+    pub xai_web_search: bool,
+    #[serde(default = "default_xai_x_search")]
+    pub xai_x_search: bool,
+    #[serde(default = "default_xai_code_interpreter")]
+    pub xai_code_interpreter: bool,
 }
 
 impl Default for AppConfig {
@@ -50,6 +56,9 @@ impl Default for AppConfig {
             auto_approve: default_auto_approve(),
             verbose_tools: default_verbose_tools(),
             context_budget_bytes: default_context_budget_bytes(),
+            xai_web_search: default_xai_web_search(),
+            xai_x_search: default_xai_x_search(),
+            xai_code_interpreter: default_xai_code_interpreter(),
         }
     }
 }
@@ -131,4 +140,16 @@ fn default_verbose_tools() -> bool {
 
 fn default_context_budget_bytes() -> usize {
     256 * 1024
+}
+
+fn default_xai_web_search() -> bool {
+    true
+}
+
+fn default_xai_x_search() -> bool {
+    true
+}
+
+fn default_xai_code_interpreter() -> bool {
+    false
 }

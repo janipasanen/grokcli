@@ -5,6 +5,9 @@ use crate::output::{OutputSink, StdOutputSink};
 use crate::persistence::patch_store::PatchStore;
 use crate::persistence::session_store::SessionStore;
 use crate::provider::LanguageModelProvider;
+use crate::provider::agent_tools::{
+    effective_built_in_tools_json, effective_model_for_tools, requested_built_in_tools_json,
+};
 use crate::provider::models::build_simple_request;
 use crate::tools::registry::{ToolCallRequest, ToolCallResult, ToolRegistry};
 use anyhow::{Result, bail};
@@ -89,12 +92,23 @@ impl AgentRuntime {
         }
         session.append("user_message", SessionStore::prompt_payload(&prompt))?;
         let repo_root = env::current_dir()?;
+        let requested_model = normalize_model_name(&self.cfg.model);
+        let normalized_model =
+            effective_model_for_tools(&self.cfg, &requested_model, &self.cfg.api_mode);
+        let requested_built_in_tools = requested_built_in_tools_json(&self.cfg);
+        let built_in_tools = effective_built_in_tools_json(&self.cfg, &normalized_model);
+        if !requested_built_in_tools.is_empty() && normalized_model != requested_model {
+            self.output.stderr_line(&format!(
+                "switching model from {} to {} because xAI server-side tools require a Grok-4 family model",
+                requested_model, normalized_model
+            ));
+        }
 
         if self.max_steps <= 1 {
             let single_step_instructions = build_single_step_instructions(&repo_root);
             let text = if self.cfg.api_mode.eq_ignore_ascii_case("chat_completions") {
                 let body = json!({
-                    "model": normalize_model_name(&self.cfg.model),
+                    "model": normalized_model.clone(),
                     "messages": [
                         { "role": "system", "content": single_step_instructions.clone() },
                         { "role": "user", "content": prompt.clone() }
@@ -112,14 +126,20 @@ impl AgentRuntime {
                     .unwrap_or_default()
                     .to_string()
             } else {
+                let response_tools = responses_tools(&built_in_tools, None);
                 let mut request = build_simple_request(
-                    self.cfg.model.clone(),
+                    normalized_model.clone(),
                     prompt.clone(),
                     self.cfg.stream,
                     self.cfg.parallel_tool_calls,
                     self.cfg.store,
                     self.cfg.max_output_tokens,
                     self.cfg.temperature,
+                    if response_tools.is_empty() {
+                        None
+                    } else {
+                        Some(response_tools)
+                    },
                 );
                 request.instructions = Some(single_step_instructions.clone());
                 let resp = if self.cfg.stream {
@@ -136,7 +156,7 @@ impl AgentRuntime {
                             "responses endpoint unavailable, falling back to /v1/chat/completions",
                         );
                         let body = json!({
-                            "model": normalize_model_name(&self.cfg.model),
+                            "model": normalized_model.clone(),
                             "messages": [
                                 { "role": "system", "content": single_step_instructions.clone() },
                                 { "role": "user", "content": prompt.clone() }
@@ -169,6 +189,10 @@ impl AgentRuntime {
         }
 
         let registry = ToolRegistry::new(&repo_root);
+        let tool_definitions = Value::Array(responses_tools(
+            &built_in_tools,
+            Some(registry.definitions_json()),
+        ));
         let mut approval_cache = HashSet::new();
         if self.cfg.api_mode.eq_ignore_ascii_case("chat_completions") {
             self.run_chat_completions_loop(
@@ -186,6 +210,8 @@ impl AgentRuntime {
                     client,
                     &session,
                     &registry,
+                    &tool_definitions,
+                    &normalized_model,
                     &repo_root,
                     &mut approval_cache,
                     resumed_previous_response_id.clone(),
@@ -238,6 +264,14 @@ fn normalize_model_name(model: &str) -> String {
     }
 }
 
+fn responses_tools(built_in_tools: &[Value], local_tools: Option<Value>) -> Vec<Value> {
+    let mut tools = built_in_tools.to_vec();
+    if let Some(local) = local_tools.and_then(|value| value.as_array().cloned()) {
+        tools.extend(local);
+    }
+    tools
+}
+
 fn validate_model_configuration(cfg: &AppConfig) -> Result<()> {
     let model = normalize_model_name(&cfg.model);
     if model.contains("multi-agent") {
@@ -255,6 +289,8 @@ impl AgentRuntime {
         client: &dyn LanguageModelProvider,
         session: &SessionStore,
         registry: &ToolRegistry,
+        tool_definitions: &Value,
+        model: &str,
         repo_root: &std::path::Path,
         approval_cache: &mut HashSet<String>,
         resumed_previous_response_id: Option<String>,
@@ -278,9 +314,9 @@ impl AgentRuntime {
 
         for step in 0..self.max_steps {
             let mut body = json!({
-                "model": normalize_model_name(&self.cfg.model),
+                "model": model,
                 "input": pending_input,
-                "tools": registry.definitions_json(),
+                "tools": tool_definitions.clone(),
                 "stream": self.cfg.stream,
                 "parallel_tool_calls": self.cfg.parallel_tool_calls,
                 "store": store,

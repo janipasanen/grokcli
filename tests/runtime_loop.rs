@@ -188,6 +188,7 @@ async fn runtime_streaming_responses_executes_tool() -> Result<()> {
         vec![responses_tool_call_response()],
     );
     let mut cfg = AppConfig::default();
+    cfg.model = "grok-4-1-fast-reasoning".to_string();
     cfg.api_mode = "responses".to_string();
     cfg.stream = true;
     let runtime = AgentRuntime::new(cfg, 3);
@@ -204,6 +205,13 @@ async fn runtime_streaming_responses_executes_tool() -> Result<()> {
     );
     assert_eq!(first.get("store").and_then(Value::as_bool), Some(true));
     assert_eq!(first.get("stream").and_then(Value::as_bool), Some(true));
+    let tools = first
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("responses tools");
+    assert!(tools.iter().any(|tool| tool.get("type") == Some(&json!("web_search"))));
+    assert!(tools.iter().any(|tool| tool.get("type") == Some(&json!("x_search"))));
+    assert!(tools.iter().any(|tool| tool.get("name") == Some(&json!("list_directory"))));
     Ok(())
 }
 
@@ -277,6 +285,81 @@ async fn runtime_omits_instructions_on_responses_continuation() -> Result<()> {
         second.get("instructions").is_none(),
         "continuation request must omit instructions"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn runtime_can_disable_builtin_responses_tools() -> Result<()> {
+    let _guard = test_env_guard();
+    let dir = tempdir()?;
+    unsafe {
+        std::env::set_var("HOME", dir.path());
+    }
+    std::env::set_current_dir(dir.path())?;
+    std::fs::write(dir.path().join("alpha.txt"), "alpha")?;
+
+    let provider = MockProvider::new(
+        vec![responses_final_response()],
+        vec![responses_tool_call_response()],
+    );
+    let mut cfg = AppConfig::default();
+    cfg.api_mode = "responses".to_string();
+    cfg.stream = true;
+    cfg.xai_web_search = false;
+    cfg.xai_x_search = false;
+    cfg.model = "grok-4-1-fast-reasoning".to_string();
+    let runtime = AgentRuntime::new(cfg, 3);
+    runtime
+        .run_ask(&provider, "list files".to_string(), None)
+        .await?;
+
+    let requests = provider.recorded_requests();
+    let first = &requests[0];
+    let tools = first
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("responses tools");
+    assert!(!tools.iter().any(|tool| tool.get("type") == Some(&json!("web_search"))));
+    assert!(!tools.iter().any(|tool| tool.get("type") == Some(&json!("x_search"))));
+    assert!(tools.iter().any(|tool| tool.get("name") == Some(&json!("list_directory"))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_code_model_promotes_to_tool_capable_model() -> Result<()> {
+    let _guard = test_env_guard();
+    let dir = tempdir()?;
+    unsafe {
+        std::env::set_var("HOME", dir.path());
+    }
+    std::env::set_current_dir(dir.path())?;
+    std::fs::write(dir.path().join("alpha.txt"), "alpha")?;
+
+    let provider = MockProvider::new(
+        vec![responses_final_response()],
+        vec![responses_tool_call_response()],
+    );
+    let mut cfg = AppConfig::default();
+    cfg.api_mode = "responses".to_string();
+    cfg.stream = true;
+    let runtime = AgentRuntime::new(cfg, 3);
+    runtime
+        .run_ask(&provider, "list files".to_string(), None)
+        .await?;
+
+    let requests = provider.recorded_requests();
+    let first = &requests[0];
+    assert_eq!(
+        first.get("model").and_then(Value::as_str),
+        Some("grok-4-1-fast-reasoning")
+    );
+    let tools = first
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("responses tools");
+    assert!(tools.iter().any(|tool| tool.get("type") == Some(&json!("web_search"))));
+    assert!(tools.iter().any(|tool| tool.get("type") == Some(&json!("x_search"))));
+    assert!(tools.iter().any(|tool| tool.get("name") == Some(&json!("list_directory"))));
     Ok(())
 }
 

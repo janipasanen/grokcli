@@ -7,6 +7,7 @@ use grokcli::persistence::patch_store::PatchStore;
 use grokcli::persistence::session_store::{
     SessionStore, latest_session_path, resolve_session_path,
 };
+use grokcli::provider::agent_tools::{effective_built_in_tools_json, effective_model_for_tools};
 use grokcli::provider::xai_client::XaiClient;
 use grokcli::workflows::presets::{WorkflowPreset, apply_preset_prompt, infer_preset_for_prompt};
 use rustyline::error::ReadlineError;
@@ -360,6 +361,40 @@ struct Cli {
     context_budget_bytes: Option<usize>,
     #[arg(
         long,
+        help_heading = "Model",
+        help = "Enable xAI Responses web_search tool for this run.",
+        conflicts_with = "no_xai_web_search"
+    )]
+    xai_web_search: bool,
+    #[arg(
+        long,
+        help_heading = "Model",
+        help = "Disable xAI Responses web_search tool for this run.",
+        conflicts_with = "xai_web_search"
+    )]
+    no_xai_web_search: bool,
+    #[arg(
+        long,
+        help_heading = "Model",
+        help = "Enable xAI Responses x_search tool for this run.",
+        conflicts_with = "no_xai_x_search"
+    )]
+    xai_x_search: bool,
+    #[arg(
+        long,
+        help_heading = "Model",
+        help = "Disable xAI Responses x_search tool for this run.",
+        conflicts_with = "xai_x_search"
+    )]
+    no_xai_x_search: bool,
+    #[arg(
+        long,
+        help_heading = "Model",
+        help = "Enable xAI Responses code_interpreter tool for this run."
+    )]
+    xai_code_interpreter: bool,
+    #[arg(
+        long,
         help_heading = "Help",
         help = "Show extended help sections and exit."
     )]
@@ -410,12 +445,28 @@ async fn main() -> Result<()> {
     if let Some(bytes) = cli.context_budget_bytes {
         cfg.context_budget_bytes = bytes;
     }
+    if cli.xai_web_search {
+        cfg.xai_web_search = true;
+    }
+    if cli.no_xai_web_search {
+        cfg.xai_web_search = false;
+    }
+    if cli.xai_x_search {
+        cfg.xai_x_search = true;
+    }
+    if cli.no_xai_x_search {
+        cfg.xai_x_search = false;
+    }
+    if cli.xai_code_interpreter {
+        cfg.xai_code_interpreter = true;
+    }
 
     let selected_mode = cli.mode.unwrap_or(AgentMode::Agent);
-    let header_model = cfg.model.clone();
+    let header_model = effective_model_for_tools(&cfg, &cfg.model, &cfg.api_mode);
     let header_api_mode = cfg.api_mode.clone();
     let header_auto_approve = cfg.auto_approve;
     let header_verbose_tools = cfg.verbose_tools;
+    let header_xai_tools = format_xai_tools(&cfg, &header_model);
     let has_primary_prompt = cli
         .prompt
         .as_ref()
@@ -467,6 +518,7 @@ async fn main() -> Result<()> {
         effective_max_steps(&selected_mode, cli.max_steps),
         header_auto_approve,
         header_verbose_tools,
+        header_xai_tools,
         effective_preset
             .as_ref()
             .and_then(|p| p.to_possible_value())
@@ -529,6 +581,7 @@ fn print_help_sections() {
     println!("  --auto-approve bypasses prompts for this run.");
     println!("  --verbose-tools / --no-verbose-tools toggle detailed tool previews.");
     println!("  --queue <text> adds a queued prompt for non-interactive runs.");
+    println!("  xAI Responses built-in tools default to web_search+x_search; code_interpreter is opt-in.");
     println!();
     println!("Sessions:");
     println!("  Session logs: ~/.local/share/grok-agent/sessions/*.jsonl");
@@ -835,14 +888,18 @@ fn print_interactive_state(state: &InteractiveState) {
         .map(|v| v.get_name().to_string())
         .unwrap_or_else(|| "off".to_string());
     println!(
-        "mode={} model={} api_mode={} max_steps={} auto_approve={} verbose_tools={} stream={} preset={} context_budget_bytes={} queued={}",
+        "mode={} model={} api_mode={} max_steps={} auto_approve={} verbose_tools={} stream={} xai_tools={} preset={} context_budget_bytes={} queued={}",
         mode_name(&state.mode),
-        state.cfg.model,
+        effective_model_for_tools(&state.cfg, &state.cfg.model, &state.cfg.api_mode),
         state.cfg.api_mode,
         effective_max_steps(&state.mode, state.max_steps),
         state.cfg.auto_approve,
         state.cfg.verbose_tools,
         state.cfg.stream,
+        format_xai_tools(
+            &state.cfg,
+            &effective_model_for_tools(&state.cfg, &state.cfg.model, &state.cfg.api_mode),
+        ),
         preset,
         state.cfg.context_budget_bytes,
         queued_task_count(state),
@@ -1195,18 +1252,20 @@ fn print_run_header(
     max_steps: u32,
     auto_approve: bool,
     verbose_tools: bool,
+    xai_tools: String,
     effective_preset: Option<String>,
     queued_tasks: usize,
     resumed_session: Option<String>,
 ) {
     eprintln!(
-        "mode={} model={} api_mode={} max_steps={} auto_approve={} verbose_tools={} queued={}",
+        "mode={} model={} api_mode={} max_steps={} auto_approve={} verbose_tools={} xai_tools={} queued={}",
         mode_name(mode),
         model,
         api_mode,
         max_steps,
         auto_approve,
         verbose_tools,
+        xai_tools,
         queued_tasks
     );
     if let Some(preset) = effective_preset {
@@ -1214,6 +1273,19 @@ fn print_run_header(
     }
     if let Some(path) = resumed_session {
         eprintln!("resuming_session={}", path);
+    }
+}
+
+fn format_xai_tools(cfg: &AppConfig, model: &str) -> String {
+    let tools = effective_built_in_tools_json(cfg, model);
+    if tools.is_empty() {
+        "off".to_string()
+    } else {
+        tools
+            .iter()
+            .filter_map(|tool| tool.get("type").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
@@ -1396,6 +1468,20 @@ mod tests {
     }
 
     #[test]
+    fn cli_accepts_xai_tool_flags() {
+        let cli = Cli::try_parse_from([
+            "grokcli",
+            "--no-xai-web-search",
+            "--xai-code-interpreter",
+            "summarize this repo",
+        ])
+        .unwrap();
+        assert!(cli.no_xai_web_search);
+        assert!(cli.xai_code_interpreter);
+        assert_eq!(cli.prompt.as_deref(), Some("summarize this repo"));
+    }
+
+    #[test]
     fn collect_cli_tasks_keeps_prompt_then_queue_order() {
         let tasks = collect_cli_tasks(
             Some("fix failing tests".to_string()),
@@ -1409,5 +1495,16 @@ mod tests {
                 "rerun tests".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn format_xai_tools_reports_enabled_tools() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(format_xai_tools(&cfg, "grok-4-1-fast-reasoning"), "web_search,x_search");
+        assert_eq!(format_xai_tools(&cfg, "grok-code-fast-1"), "off");
+        cfg.xai_web_search = false;
+        cfg.xai_x_search = false;
+        cfg.xai_code_interpreter = true;
+        assert_eq!(format_xai_tools(&cfg, "grok-4-1-fast-reasoning"), "code_interpreter");
     }
 }

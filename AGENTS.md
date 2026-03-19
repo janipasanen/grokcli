@@ -59,6 +59,17 @@ hash -r
 - Do not target `grok-4.20-multi-agent-beta-0309` for this CLI architecture. It is rejected intentionally.
 - Multi-step Responses mode must use stored responses so `previous_response_id` continues correctly.
 
+## xAI server-side tools
+
+- xAI server-side Agent Tools are a different constraint from this CLI's local client-side tools.
+- If a run uses xAI server-side tools through the Responses API, do not use `grok-code-fast-1`.
+- Treat this as a hard rule: `grok-code-fast-1` is not supported when using server-side tools, and only the Grok-4 family is supported.
+- When server-side tools are enabled, prefer a Grok-4 model such as `grok-4-1-fast-reasoning` unless there is a verified reason to choose another supported Grok-4 model.
+- If you need to confirm current xAI tool capabilities or MCP behavior, read the current xAI docs first instead of assuming older behavior:
+  - `https://docs.x.ai/developers/tools/overview`
+  - `https://docs.x.ai/api/mcp`
+- Do not regress future changes back to unsupported combinations of server-side tools plus non-Grok-4 models.
+
 ## Interactive shell expectations
 
 No-argument `grokcli` starts the shell.

@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
+use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ApplyPatchArgs {
@@ -34,7 +36,38 @@ pub fn run(repo_root: &Path, args: ApplyPatchArgs) -> Result<ApplyPatchResult> {
         }
     };
 
-    let (check_ok, check_stderr) = run_git_apply(repo_root, &normalized_patch, true)?;
+    let mut patch_to_apply = normalized_patch;
+    let (mut check_ok, mut check_stderr) = run_git_apply(repo_root, &patch_to_apply, true)?;
+    if !check_ok
+        && let Some(rewritten_patch) =
+            rewrite_missing_file_updates_to_additions(&patch_to_apply, &check_stderr)
+    {
+        let (retry_ok, retry_stderr) = run_git_apply(repo_root, &rewritten_patch, true)?;
+        if retry_ok {
+            patch_to_apply = rewritten_patch;
+            check_ok = true;
+            check_stderr = retry_stderr;
+        }
+    }
+    if !check_ok && ensure_missing_files_exist(repo_root, &check_stderr).is_ok() {
+        let (retry_ok, retry_stderr) = run_git_apply(repo_root, &patch_to_apply, true)?;
+        if retry_ok {
+            check_ok = true;
+            check_stderr = retry_stderr;
+        }
+    }
+    if !check_ok
+        && let Some(rewritten_patch) =
+            rewrite_new_file_depends_on_old_contents(&patch_to_apply, &check_stderr)
+    {
+        let (retry_ok, retry_stderr) = run_git_apply(repo_root, &rewritten_patch, true)?;
+        if retry_ok {
+            patch_to_apply = rewritten_patch;
+            check_ok = true;
+            check_stderr = retry_stderr;
+        }
+    }
+
     if !check_ok {
         return Ok(ApplyPatchResult {
             valid: false,
@@ -55,7 +88,7 @@ pub fn run(repo_root: &Path, args: ApplyPatchArgs) -> Result<ApplyPatchResult> {
         });
     }
 
-    let (apply_ok, apply_stderr) = run_git_apply(repo_root, &normalized_patch, false)?;
+    let (apply_ok, apply_stderr) = run_git_apply(repo_root, &patch_to_apply, false)?;
     Ok(ApplyPatchResult {
         valid: true,
         applied: apply_ok,
@@ -66,8 +99,66 @@ pub fn run(repo_root: &Path, args: ApplyPatchArgs) -> Result<ApplyPatchResult> {
 }
 
 fn run_git_apply(repo_root: &Path, patch: &str, check_only: bool) -> Result<(bool, String)> {
+    let (ok, stderr) = run_git_apply_with_args(repo_root, patch, check_only, false)?;
+    if ok {
+        return Ok((ok, stderr));
+    }
+
+    if stderr.contains("patch does not apply") || stderr.contains("patch failed:") {
+        let skip_three_way = patch_targets_from_unified_diff(patch)
+            .into_iter()
+            .any(|target| !is_path_tracked(repo_root, &target).unwrap_or(false));
+        let (retry_ok, retry_stderr) = if skip_three_way {
+            (false, "3way-retry skipped: target file not tracked in index".to_string())
+        } else {
+            run_git_apply_with_args(repo_root, patch, check_only, true)?
+        };
+        if retry_ok {
+            return Ok((true, retry_stderr));
+        }
+        let (patch_ok, patch_stderr) = run_patch_utility(repo_root, patch, check_only)?;
+        if patch_ok {
+            return Ok((true, patch_stderr));
+        }
+        let merged = if retry_stderr.trim().is_empty() {
+            if patch_stderr.trim().is_empty() {
+                stderr
+            } else {
+                format!("{stderr}\npatch-fallback:\n{patch_stderr}")
+            }
+        } else if stderr.trim().is_empty() {
+            if patch_stderr.trim().is_empty() {
+                retry_stderr
+            } else {
+                format!("{retry_stderr}\npatch-fallback:\n{patch_stderr}")
+            }
+        } else {
+            if patch_stderr.trim().is_empty() {
+                format!("{stderr}\n3way-retry:\n{retry_stderr}")
+            } else {
+                format!("{stderr}\n3way-retry:\n{retry_stderr}\npatch-fallback:\n{patch_stderr}")
+            }
+        };
+        return Ok((false, merged));
+    }
+
+    Ok((ok, stderr))
+}
+
+fn run_git_apply_with_args(
+    repo_root: &Path,
+    patch: &str,
+    check_only: bool,
+    three_way: bool,
+) -> Result<(bool, String)> {
     let mut cmd = Command::new("git");
     cmd.arg("apply");
+    cmd.arg("--recount");
+    cmd.arg("--ignore-space-change");
+    cmd.arg("--ignore-whitespace");
+    if three_way {
+        cmd.arg("--3way");
+    }
     if check_only {
         cmd.arg("--check");
     }
@@ -89,6 +180,62 @@ fn run_git_apply(repo_root: &Path, patch: &str, check_only: bool) -> Result<(boo
     let ok = output.status.success();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     Ok((ok, stderr))
+}
+
+fn run_patch_utility(repo_root: &Path, patch: &str, check_only: bool) -> Result<(bool, String)> {
+    let mut combined_errors = Vec::new();
+    for strip in ["-p1", "-p0", "-p2"] {
+        let (ok, stderr) = run_patch_with_strip(repo_root, patch, check_only, strip)?;
+        if ok {
+            return Ok((true, stderr));
+        }
+        if !stderr.trim().is_empty() {
+            combined_errors.push(format!("{strip}: {stderr}"));
+        }
+    }
+    Ok((false, combined_errors.join("\n")))
+}
+
+fn run_patch_with_strip(
+    repo_root: &Path,
+    patch: &str,
+    check_only: bool,
+    strip_level: &str,
+) -> Result<(bool, String)> {
+    let mut cmd = Command::new("patch");
+    if check_only {
+        cmd.arg("--dry-run");
+    }
+    cmd.arg("--batch")
+        .arg("--forward")
+        .arg("--fuzz=10")
+        .arg(strip_level)
+        .current_dir(repo_root)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped());
+
+    let mut child = cmd.spawn().context("failed to spawn patch utility")?;
+    {
+        let stdin = child.stdin.as_mut().context("failed to open patch stdin")?;
+        stdin
+            .write_all(patch.as_bytes())
+            .context("failed to write patch utility stdin")?;
+    }
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for patch utility")?;
+    let ok = output.status.success();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let combined = if stderr.trim().is_empty() {
+        stdout
+    } else if stdout.trim().is_empty() {
+        stderr
+    } else {
+        format!("{stderr}\n{stdout}")
+    };
+    Ok((ok, combined))
 }
 
 fn normalize_patch(patch: &str) -> std::result::Result<String, String> {
@@ -115,38 +262,15 @@ fn codex_patch_to_unified_diff(patch: &str) -> std::result::Result<String, Strin
         if line.starts_with("*** End Patch") {
             break;
         }
+        if line.starts_with("*** End of File") {
+            continue;
+        }
         if line.is_empty() {
             continue;
         }
 
         if let Some(path) = line.strip_prefix("*** Update File: ") {
-            let mut new_path = path.to_string();
-            if let Some(next) = lines.peek().copied()
-                && let Some(moved_to) = next.strip_prefix("*** Move to: ")
-            {
-                new_path = moved_to.to_string();
-                let _ = lines.next();
-            }
-            let mut section = Vec::new();
-            while let Some(next) = lines.peek().copied() {
-                if next.starts_with("*** ") {
-                    break;
-                }
-                section.push(normalize_hunk_line(next));
-                let _ = lines.next();
-            }
-            if section.is_empty() {
-                return Err(format!(
-                    "invalid Codex patch format for `{path}`: empty update section"
-                ));
-            }
-            let section = normalize_codex_hunks_or_wrap(&section);
-            let _ = writeln!(unified, "diff --git a/{path} b/{new_path}");
-            let _ = writeln!(unified, "--- a/{path}");
-            let _ = writeln!(unified, "+++ b/{new_path}");
-            for hunk_line in section {
-                let _ = writeln!(unified, "{hunk_line}");
-            }
+            append_codex_update_section(&mut unified, path, &mut lines)?;
             continue;
         }
 
@@ -188,6 +312,11 @@ fn codex_patch_to_unified_diff(patch: &str) -> std::result::Result<String, Strin
             ));
         }
 
+        if looks_like_path_line(line) {
+            append_codex_update_section(&mut unified, line, &mut lines)?;
+            continue;
+        }
+
         return Err(format!("invalid Codex patch format line: `{line}`"));
     }
 
@@ -196,6 +325,66 @@ fn codex_patch_to_unified_diff(patch: &str) -> std::result::Result<String, Strin
     }
 
     Ok(unified)
+}
+
+fn append_codex_update_section<'a, I>(
+    out: &mut String,
+    path: &str,
+    lines: &mut std::iter::Peekable<I>,
+) -> std::result::Result<(), String>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let mut new_path = path.to_string();
+    if let Some(next) = lines.peek().copied()
+        && let Some(moved_to) = next.strip_prefix("*** Move to: ")
+    {
+        new_path = moved_to.to_string();
+        let _ = lines.next();
+    }
+    let mut section = Vec::new();
+    while let Some(next) = lines.peek().copied() {
+        if next.starts_with("*** ") {
+            break;
+        }
+        if looks_like_embedded_diff_header(next) {
+            let _ = lines.next();
+            continue;
+        }
+        section.push(normalize_hunk_line(next));
+        let _ = lines.next();
+    }
+    if section.is_empty() {
+        return Err(format!(
+            "invalid Codex patch format for `{path}`: empty update section"
+        ));
+    }
+    let section = normalize_codex_hunks_or_wrap(&section);
+    let _ = writeln!(out, "diff --git a/{path} b/{new_path}");
+    let _ = writeln!(out, "--- a/{path}");
+    let _ = writeln!(out, "+++ b/{new_path}");
+    for hunk_line in section {
+        let _ = writeln!(out, "{hunk_line}");
+    }
+    Ok(())
+}
+
+fn looks_like_path_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains(" ") {
+        return false;
+    }
+    trimmed.contains('/') || trimmed.ends_with(".swift") || trimmed.ends_with(".leaf")
+}
+
+fn looks_like_embedded_diff_header(line: &str) -> bool {
+    line.starts_with("diff --git ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("index ")
 }
 
 fn sanitize_patch_input(input: &str) -> String {
@@ -238,9 +427,249 @@ fn strip_markdown_fence(input: &str) -> Option<String> {
     Some(rest[..close].to_string())
 }
 
+fn rewrite_missing_file_updates_to_additions(patch: &str, check_stderr: &str) -> Option<String> {
+    let missing_files = extract_missing_file_paths(check_stderr);
+    if missing_files.is_empty() {
+        return None;
+    }
+
+    let missing: HashSet<&str> = missing_files.iter().map(String::as_str).collect();
+    let mut out = Vec::new();
+    let mut modified = false;
+    let mut pending_new_file_mode_for: Option<String> = None;
+
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            let mut parts = rest.split_whitespace();
+            if let (Some(a_path), Some(b_path_part)) = (parts.next(), parts.next()) {
+                let b_path = b_path_part.strip_prefix("b/").unwrap_or(b_path_part);
+                if missing.contains(a_path) || missing.contains(b_path) {
+                    pending_new_file_mode_for = Some(a_path.to_string());
+                } else {
+                    pending_new_file_mode_for = None;
+                }
+            }
+            out.push(line.to_string());
+            continue;
+        }
+
+        if line.starts_with("new file mode ") {
+            pending_new_file_mode_for = None;
+            out.push(line.to_string());
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("--- a/") {
+            if missing.contains(path) {
+                if pending_new_file_mode_for.is_some() {
+                    out.push("new file mode 100644".to_string());
+                    pending_new_file_mode_for = None;
+                }
+                out.push("--- /dev/null".to_string());
+                modified = true;
+                continue;
+            }
+        }
+
+        out.push(line.to_string());
+    }
+
+    if !modified {
+        return None;
+    }
+
+    let mut normalized = out.join("\n");
+    if !normalized.ends_with('\n') {
+        normalized.push('\n');
+    }
+    Some(normalized)
+}
+
+fn extract_missing_file_paths(stderr: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("error: ")
+            && let Some(path) = rest.strip_suffix(": No such file or directory")
+            && !paths.iter().any(|existing| existing == path)
+        {
+            paths.push(path.to_string());
+        }
+    }
+    paths
+}
+
+fn ensure_missing_files_exist(repo_root: &Path, stderr: &str) -> Result<()> {
+    for path in extract_missing_file_paths(stderr) {
+        if path.trim().is_empty() {
+            continue;
+        }
+        let rel = PathBuf::from(path);
+        if rel.is_absolute() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            continue;
+        }
+        let full = repo_root.join(rel);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create parent dir for {:?}", full))?;
+        }
+        if !full.exists() {
+            fs::write(&full, b"").with_context(|| format!("failed to create {:?}", full))?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_new_file_depends_on_old_contents(patch: &str, check_stderr: &str) -> Option<String> {
+    let affected_files = extract_new_file_depends_paths(check_stderr);
+    if affected_files.is_empty() {
+        return None;
+    }
+    let affected: HashSet<&str> = affected_files.iter().map(String::as_str).collect();
+
+    let mut out = String::new();
+    let mut section = Vec::new();
+    let mut modified = false;
+
+    let flush_section = |section: &mut Vec<String>, out: &mut String, modified: &mut bool| {
+        if section.is_empty() {
+            return;
+        }
+        let rewritten = rewrite_new_file_section(section, &affected);
+        if rewritten.1 {
+            *modified = true;
+        }
+        out.push_str(&rewritten.0);
+        section.clear();
+    };
+
+    for line in patch.lines() {
+        if line.starts_with("diff --git ") && !section.is_empty() {
+            flush_section(&mut section, &mut out, &mut modified);
+        }
+        section.push(line.to_string());
+    }
+    flush_section(&mut section, &mut out, &mut modified);
+
+    if !modified {
+        return None;
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Some(out)
+}
+
+fn rewrite_new_file_section(section: &[String], affected: &HashSet<&str>) -> (String, bool) {
+    if section.is_empty() {
+        return (String::new(), false);
+    }
+    let path = detect_patch_section_path(section);
+    let Some(path) = path else {
+        return (section.join("\n") + "\n", false);
+    };
+    if !affected.contains(path.as_str()) {
+        return (section.join("\n") + "\n", false);
+    }
+
+    let mut additions: Vec<String> = Vec::new();
+    for line in section {
+        if line.starts_with("+++ ") || line.starts_with("--- ") || line.starts_with("@@") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('+') {
+            additions.push(rest.to_string());
+        }
+    }
+
+    let mut out = String::new();
+    let _ = writeln!(out, "diff --git a/{path} b/{path}");
+    let _ = writeln!(out, "new file mode 100644");
+    let _ = writeln!(out, "--- /dev/null");
+    let _ = writeln!(out, "+++ b/{path}");
+    let additions_count = additions.len();
+    let header = match additions_count {
+        0 => "@@ -0,0 +0,0 @@".to_string(),
+        1 => "@@ -0,0 +1 @@".to_string(),
+        _ => format!("@@ -0,0 +1,{additions_count} @@"),
+    };
+    let _ = writeln!(out, "{header}");
+    for add in additions {
+        let _ = writeln!(out, "+{add}");
+    }
+    (out, true)
+}
+
+fn detect_patch_section_path(section: &[String]) -> Option<String> {
+    for line in section {
+        if let Some(rest) = line.strip_prefix("+++ b/") {
+            return Some(rest.to_string());
+        }
+    }
+    for line in section {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            let mut parts = rest.split_whitespace();
+            if let (Some(_left), Some(right)) = (parts.next(), parts.next()) {
+                return Some(right.trim_start_matches("b/").to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_new_file_depends_paths(stderr: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in stderr.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("error: new file ")
+            && let Some(path) = rest.strip_suffix(" depends on old contents")
+            && !paths.iter().any(|existing| existing == path)
+        {
+            paths.push(path.to_string());
+        }
+    }
+    paths
+}
+
+fn patch_targets_from_unified_diff(patch: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for line in patch.lines() {
+        if let Some(path) = line.strip_prefix("+++ b/") {
+            if path != "/dev/null" && !targets.iter().any(|p| p == path) {
+                targets.push(path.to_string());
+            }
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("+++ ") {
+            if path != "/dev/null" {
+                let normalized = path.strip_prefix("b/").unwrap_or(path);
+                if !targets.iter().any(|p| p == normalized) {
+                    targets.push(normalized.to_string());
+                }
+            }
+        }
+    }
+    targets
+}
+
+fn is_path_tracked(repo_root: &Path, path: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("ls-files")
+        .arg("--error-unmatch")
+        .arg("--")
+        .arg(path)
+        .current_dir(repo_root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("failed to query git index")?;
+    Ok(output.status.success())
+}
+
 fn normalize_unified_diff_hunks(patch: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut in_hunk = false;
+    let mut in_file_section = false;
     let mut old_start = 1usize;
     let mut new_start = 1usize;
     let mut hunk_start_idx: Option<usize> = None;
@@ -264,7 +693,9 @@ fn normalize_unified_diff_hunks(patch: &str) -> String {
         }
     };
 
-    for raw_line in patch.lines() {
+    for original_line in patch.lines() {
+        let normalized_header = normalize_unified_header_line(original_line);
+        let raw_line = normalized_header.as_str();
         let is_header = raw_line.starts_with("diff --git ")
             || raw_line.starts_with("--- ")
             || raw_line.starts_with("+++ ")
@@ -291,6 +722,12 @@ fn normalize_unified_diff_hunks(patch: &str) -> String {
             }
         }
 
+        if raw_line.starts_with("+++ ") {
+            in_file_section = true;
+            out.push(raw_line.to_string());
+            continue;
+        }
+
         if raw_line.starts_with("@@") {
             in_hunk = true;
             let line = raw_line.trim().to_string();
@@ -298,6 +735,24 @@ fn normalize_unified_diff_hunks(patch: &str) -> String {
                 hunk_start_idx = Some(out.len());
             }
             out.push(line);
+            continue;
+        }
+
+        if in_file_section && !in_hunk && !is_header && looks_like_hunk_body_line(raw_line) {
+            in_hunk = true;
+            hunk_start_idx = Some(out.len());
+            out.push("@@".to_string());
+            let normalized = normalize_hunk_line(raw_line);
+            match normalized.chars().next() {
+                Some(' ') => {
+                    old_count += 1;
+                    new_count += 1;
+                }
+                Some('-') => old_count += 1,
+                Some('+') => new_count += 1,
+                _ => {}
+            }
+            out.push(normalized);
             continue;
         }
 
@@ -335,6 +790,69 @@ fn normalize_unified_diff_hunks(patch: &str) -> String {
         normalized.push('\n');
     }
     normalized
+}
+
+fn looks_like_hunk_body_line(line: &str) -> bool {
+    if line.is_empty() {
+        return true;
+    }
+    matches!(line.chars().next(), Some(' ') | Some('+') | Some('-') | Some('\\'))
+        || !line.starts_with("diff --git ")
+            && !line.starts_with("--- ")
+            && !line.starts_with("+++ ")
+            && !line.starts_with("index ")
+            && !line.starts_with("new file mode ")
+            && !line.starts_with("deleted file mode ")
+}
+
+fn normalize_unified_header_line(line: &str) -> String {
+    if let Some(rest) = line.strip_prefix("diff --git ") {
+        let mut parts = rest.split_whitespace();
+        if let (Some(left), Some(right)) = (parts.next(), parts.next()) {
+            return format!(
+                "diff --git {} {}",
+                ensure_diff_left_path(left),
+                ensure_diff_right_path(right)
+            );
+        }
+        return line.to_string();
+    }
+
+    if let Some(path) = line.strip_prefix("--- ") {
+        if path == "/dev/null" {
+            return line.to_string();
+        }
+        return format!("--- {}", ensure_diff_left_path(path));
+    }
+
+    if let Some(path) = line.strip_prefix("+++ ") {
+        if path == "/dev/null" {
+            return line.to_string();
+        }
+        return format!("+++ {}", ensure_diff_right_path(path));
+    }
+
+    line.to_string()
+}
+
+fn ensure_diff_left_path(path: &str) -> String {
+    if path.starts_with("a/") {
+        return path.to_string();
+    }
+    if let Some(stripped) = path.strip_prefix("b/") {
+        return format!("a/{stripped}");
+    }
+    format!("a/{path}")
+}
+
+fn ensure_diff_right_path(path: &str) -> String {
+    if path.starts_with("b/") {
+        return path.to_string();
+    }
+    if let Some(stripped) = path.strip_prefix("a/") {
+        return format!("b/{stripped}");
+    }
+    format!("b/{path}")
 }
 
 fn normalize_codex_hunks_or_wrap(section: &[String]) -> Vec<String> {
@@ -427,25 +945,34 @@ fn count_hunk_lines(lines: &[String]) -> (usize, usize) {
 }
 
 fn normalize_hunk_line(line: &str) -> String {
+    let line = normalize_common_escaped_content(line);
     if line.starts_with("\\ No newline at end of file") {
-        return line.to_string();
+        return line;
     }
     match line.chars().next() {
-        Some(' ') | Some('+') | Some('-') | Some('@') => line.to_string(),
+        Some(' ') | Some('+') | Some('-') | Some('@') => line,
         _ => format!(" {line}"),
     }
 }
 
 fn normalize_add_file_line(line: &str) -> String {
+    let line = normalize_common_escaped_content(line);
     if line.starts_with("\\ No newline at end of file") {
-        return line.to_string();
+        return line;
     }
     match line.chars().next() {
-        Some('+') => line.to_string(),
+        Some('+') => line,
         Some(' ') => format!("+{}", &line[1..]),
         Some('-') => format!("+{}", &line[1..]),
         _ => format!("+{line}"),
     }
+}
+
+fn normalize_common_escaped_content(line: &str) -> String {
+    if line.contains("\\\"") {
+        return line.replace("\\\"", "\"");
+    }
+    line.to_string()
 }
 
 fn hunk_range(start: usize, count: usize) -> String {
@@ -704,6 +1231,352 @@ diff --git a/demo.txt b/demo.txt
         assert!(result.valid, "{}", result.check_stderr);
         assert!(result.applied, "{}", result.apply_stderr);
         assert_eq!(fs::read_to_string(dir.path().join("demo.txt"))?, "new\n");
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_unified_diff_without_any_hunk_header() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("demo.txt"), "old\n")?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+diff --git a/demo.txt b/demo.txt
+--- a/demo.txt
++++ b/demo.txt
+-old
++new
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(result.valid, "{}", result.check_stderr);
+        assert!(result.applied, "{}", result.apply_stderr);
+        assert_eq!(fs::read_to_string(dir.path().join("demo.txt"))?, "new\n");
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_unified_diff_without_hunk_header_and_with_context_lines() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("demo.txt"), "alpha\nold\nomega\n")?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+diff --git a/demo.txt b/demo.txt
+--- a/demo.txt
++++ b/demo.txt
+ alpha
+-old
++new
+ omega
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(result.valid, "{}", result.check_stderr);
+        assert!(result.applied, "{}", result.apply_stderr);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("demo.txt"))?,
+            "alpha\nnew\nomega\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_codex_end_of_file_marker() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("demo.txt"), "old\n")?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+*** Begin Patch
+*** Update File: demo.txt
+@@
+-old
++new
+*** End of File
+*** End Patch
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(result.valid, "{}", result.check_stderr);
+        assert!(result.applied, "{}", result.apply_stderr);
+        assert_eq!(fs::read_to_string(dir.path().join("demo.txt"))?, "new\n");
+        Ok(())
+    }
+
+    #[test]
+    fn applies_patch_with_whitespace_mismatch_in_context() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("demo.txt"), "func a() {\n    return 1\n}\n")?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+diff --git a/demo.txt b/demo.txt
+--- a/demo.txt
++++ b/demo.txt
+@@ -1,3 +1,3 @@
+ func a() {
+-  return 1
++  return 2
+ }
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(result.valid, "{}", result.check_stderr);
+        assert!(result.applied, "{}", result.apply_stderr);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("demo.txt"))?,
+            "func a() {\n  return 2\n}\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retries_missing_update_file_as_new_file_patch() -> Result<()> {
+        let dir = tempdir()?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+diff --git a/demo.txt b/demo.txt
+--- a/demo.txt
++++ b/demo.txt
+@@ -0,0 +1 @@
++hello
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(result.valid, "{}", result.check_stderr);
+        assert!(result.applied, "{}", result.apply_stderr);
+        assert_eq!(fs::read_to_string(dir.path().join("demo.txt"))?, "hello\n");
+        Ok(())
+    }
+
+    #[test]
+    fn normalizes_unified_diff_paths_without_a_b_prefixes() -> Result<()> {
+        let dir = tempdir()?;
+        fs::create_dir_all(dir.path().join("Resources/Views"))?;
+        fs::write(
+            dir.path().join("Resources/Views/page.leaf"),
+            "old\n",
+        )?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+diff --git Resources/Views/page.leaf Resources/Views/page.leaf
+--- Resources/Views/page.leaf
++++ Resources/Views/page.leaf
+@@ -1 +1 @@
+-old
++new
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(result.valid, "{}", result.check_stderr);
+        assert!(result.applied, "{}", result.apply_stderr);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("Resources/Views/page.leaf"))?,
+            "new\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retries_new_file_patch_that_depends_on_old_contents() -> Result<()> {
+        let dir = tempdir()?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+diff --git a/demo.txt b/demo.txt
+new file mode 100644
+--- /dev/null
++++ b/demo.txt
+@@ -1 +1 @@
+-old
++new
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(result.valid, "{}", result.check_stderr);
+        assert!(result.applied, "{}", result.apply_stderr);
+        assert_eq!(fs::read_to_string(dir.path().join("demo.txt"))?, "new\n");
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_codex_patch_with_bare_path_line_for_update() -> Result<()> {
+        let dir = tempdir()?;
+        fs::create_dir_all(dir.path().join("Resources/Views"))?;
+        fs::write(
+            dir.path().join("Resources/Views/edit.leaf"),
+            "old\n",
+        )?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+*** Begin Patch
+Resources/Views/edit.leaf
+@@
+-old
++new
+*** End Patch
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(result.valid, "{}", result.check_stderr);
+        assert!(result.applied, "{}", result.apply_stderr);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("Resources/Views/edit.leaf"))?,
+            "new\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unescapes_json_escaped_quotes_in_patch_lines() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join("demo.swift"),
+            "let name = \"Old\"\n",
+        )?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+*** Begin Patch
+*** Update File: demo.swift
+@@
+-let name = \"Old\"
++let name = \\\"Ink\\\"
+*** End Patch
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(result.valid, "{}", result.check_stderr);
+        assert!(result.applied, "{}", result.apply_stderr);
+        assert_eq!(fs::read_to_string(dir.path().join("demo.swift"))?, "let name = \"Ink\"\n");
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_embedded_diff_headers_inside_codex_update_section() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("Package.swift"), "let a = 1\n")?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+*** Begin Patch
+*** Update File: Package.swift
+--- a/Package.swift
++++ b/Package.swift
+@@
+-let a = 1
++let a = 2
+*** End Patch
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(result.valid, "{}", result.check_stderr);
+        assert!(result.applied, "{}", result.apply_stderr);
+        assert_eq!(fs::read_to_string(dir.path().join("Package.swift"))?, "let a = 2\n");
         Ok(())
     }
 }
