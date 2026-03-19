@@ -12,3 +12,4 @@ pub mod run_shell_command;
 pub mod run_tests;
 pub mod search_text;
 pub mod undo_last_patch;
+pub mod write_file;

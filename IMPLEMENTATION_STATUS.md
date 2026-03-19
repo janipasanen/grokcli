@@ -31,6 +31,7 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 | 9 | Patch proposal/apply | Completed | Added `apply_patch` tool with `git apply --check` validation, approval-gated apply, patch history persistence, and CLI undo via `--undo-last-patch`. |
 | 10 | Rust/Swift workflow presets | Completed | Added `--preset` CLI option with `rust-tests`, `swift-build`, and `review-changed` prompt shaping. |
 | 11 | xAI Agent Tools support in Responses mode | Completed | Added built-in `web_search` + `x_search` by default, optional `code_interpreter`, request wiring for typed and JSON Responses calls, CLI/config flags, and regression coverage. |
+| 12 | Full-file write fallback for structured markdown/docs updates | Completed | Added approval-gated `write_file` tool and updated agent guidance to use it after re-reading task/status markdown files when patch context keeps failing. |
 
 ## Progress Log
 
@@ -86,3 +87,4 @@ This file tracks implementation progress against `grok-agentic-dev-tool-architec
 - 2026-03-18: Reworked the TTY interactive shell so pressing Enter submits the prompt into a background queue and immediately returns control to the prompt; queued tasks now print through `rustyline`'s external printer so new prompts can be entered while work is running, and approval requests from queued work can be answered with `/approve yes|no`.
 - 2026-03-19: Added xAI Agent Tools support for Responses mode, wiring built-in `web_search` and `x_search` by default plus opt-in `code_interpreter`, while preserving the local audited function-tool loop and chat-completions fallback behavior.
 - 2026-03-19: Added model-aware promotion for xAI built-in tools so `grok-code-fast-1` automatically upgrades that run to `grok-4-1-fast-reasoning` instead of failing with the Responses API's grok-4-only server-tool restriction.
+- 2026-03-19: Added approval-gated `write_file` for full-file rewrites, primarily to make markdown task/status files like `docs/project-tasks.md` reliable when repeated `apply_patch` attempts fail due to stale context.

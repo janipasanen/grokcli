@@ -8,6 +8,7 @@ use grokcli::tools::checkpoint_repo::CheckpointRepoResult;
 use grokcli::tools::registry::ToolRegistry;
 use grokcli::tools::run_shell_command::RunShellCommandResult;
 use grokcli::tools::undo_last_patch::UndoLastPatchResult;
+use grokcli::tools::write_file::WriteFileResult;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -414,6 +415,13 @@ fn tool_registry_checkpoint_and_undo_require_approval() -> Result<()> {
     let undo_result: UndoLastPatchResult = serde_json::from_value(undo.result.clone())?;
     assert!(undo_result.approval_required);
 
+    let write_file = registry.execute(grokcli::tools::registry::ToolCallRequest {
+        name: "write_file".to_string(),
+        arguments: json!({ "path": "docs/project-tasks.md", "content": "# tasks\n", "approved": false }),
+    })?;
+    let write_file_result: WriteFileResult = serde_json::from_value(write_file.result.clone())?;
+    assert!(write_file_result.approval_required);
+
     Ok(())
 }
 
@@ -435,4 +443,23 @@ fn tool_registry_apply_patch_description_mentions_supported_format() {
 
     assert!(description.contains("raw unified diff"));
     assert!(description.contains("*** Begin Patch"));
+}
+
+#[test]
+fn tool_registry_write_file_description_mentions_markdown_status_use() {
+    let registry = ToolRegistry::new(".");
+    let defs = registry.definitions_json();
+    let write_file = defs
+        .as_array()
+        .and_then(|defs| {
+            defs.iter()
+                .find(|def| def.get("name").and_then(Value::as_str) == Some("write_file"))
+        })
+        .expect("write_file definition");
+    let description = write_file
+        .get("description")
+        .and_then(Value::as_str)
+        .expect("write_file description");
+
+    assert!(description.contains("markdown task/status files"));
 }

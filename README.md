@@ -164,6 +164,8 @@ Common options:
 
 The CLI always prints short `tool>` / `tool<` lines for each tool action and result. With `verbose_tools` enabled it also prints detailed previews such as file contents, directory listings, and labeled `stdout` / `stderr` blocks.
 
+For repository docs and task-tracking markdown, the agent can now fall back to `write_file` after re-reading the file when `apply_patch` context keeps failing. This is intended for structured files such as `docs/project-tasks.md` where a full rewrite is often more reliable than repeated stale hunks.
+
 Examples:
 
 ```bash

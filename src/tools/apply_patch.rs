@@ -240,8 +240,20 @@ fn run_patch_with_strip(
 
 fn normalize_patch(patch: &str) -> std::result::Result<String, String> {
     let patch = sanitize_patch_input(patch);
+    if patch.trim().is_empty() {
+        return Err(
+            "unrecognized input: apply_patch expected a patch body in unified diff or Codex patch format"
+                .to_string(),
+        );
+    }
     if patch.lines().any(|line| line.starts_with("*** Begin Patch")) {
         return codex_patch_to_unified_diff(&patch);
+    }
+    if !looks_like_patch_payload(&patch) {
+        return Err(
+            "unrecognized input: apply_patch expected a patch body in unified diff or Codex patch format"
+                .to_string(),
+        );
     }
     Ok(normalize_unified_diff_hunks(&patch))
 }
@@ -414,6 +426,13 @@ fn sanitize_patch_input(input: &str) -> String {
         text.push('\n');
     }
     text
+}
+
+fn looks_like_patch_payload(input: &str) -> bool {
+    let trimmed = input.trim_start();
+    trimmed.starts_with("diff --git ")
+        || trimmed.starts_with("--- ")
+        || trimmed.starts_with("*** Begin Patch")
 }
 
 fn strip_markdown_fence(input: &str) -> Option<String> {
@@ -673,22 +692,24 @@ fn normalize_unified_diff_hunks(patch: &str) -> String {
     let mut old_start = 1usize;
     let mut new_start = 1usize;
     let mut hunk_start_idx: Option<usize> = None;
+    let mut explicit_hunk_starts: Option<(usize, usize)> = None;
     let mut old_count = 0usize;
     let mut new_count = 0usize;
 
     let flush_hunk_header = |out: &mut Vec<String>,
                              hunk_start_idx: Option<usize>,
                              old_start: usize,
+                             explicit_hunk_starts: Option<(usize, usize)>,
                              old_count: usize,
                              new_start: usize,
                              new_count: usize| {
-        if let Some(idx) = hunk_start_idx
-            && out.get(idx).map(|line| line.trim()) == Some("@@")
-        {
+        if let Some(idx) = hunk_start_idx {
+            let (resolved_old_start, resolved_new_start) =
+                explicit_hunk_starts.unwrap_or((old_start, new_start));
             out[idx] = format!(
                 "@@ -{} +{} @@",
-                hunk_range(old_start, old_count),
-                hunk_range(new_start, new_count)
+                hunk_range(resolved_old_start, old_count),
+                hunk_range(resolved_new_start, new_count)
             );
         }
     };
@@ -708,6 +729,7 @@ fn normalize_unified_diff_hunks(patch: &str) -> String {
                 &mut out,
                 hunk_start_idx,
                 old_start,
+                explicit_hunk_starts,
                 old_count,
                 new_start,
                 new_count,
@@ -717,6 +739,7 @@ fn normalize_unified_diff_hunks(patch: &str) -> String {
             old_count = 0;
             new_count = 0;
             hunk_start_idx = None;
+            explicit_hunk_starts = None;
             if is_header {
                 in_hunk = false;
             }
@@ -730,10 +753,9 @@ fn normalize_unified_diff_hunks(patch: &str) -> String {
 
         if raw_line.starts_with("@@") {
             in_hunk = true;
+            explicit_hunk_starts = parse_hunk_starts(raw_line);
             let line = raw_line.trim().to_string();
-            if line == "@@" {
-                hunk_start_idx = Some(out.len());
-            }
+            hunk_start_idx = Some(out.len());
             out.push(line);
             continue;
         }
@@ -741,6 +763,7 @@ fn normalize_unified_diff_hunks(patch: &str) -> String {
         if in_file_section && !in_hunk && !is_header && looks_like_hunk_body_line(raw_line) {
             in_hunk = true;
             hunk_start_idx = Some(out.len());
+            explicit_hunk_starts = None;
             out.push("@@".to_string());
             let normalized = normalize_hunk_line(raw_line);
             match normalized.chars().next() {
@@ -779,6 +802,7 @@ fn normalize_unified_diff_hunks(patch: &str) -> String {
             &mut out,
             hunk_start_idx,
             old_start,
+            explicit_hunk_starts,
             old_count,
             new_start,
             new_count,
@@ -790,6 +814,24 @@ fn normalize_unified_diff_hunks(patch: &str) -> String {
         normalized.push('\n');
     }
     normalized
+}
+
+fn parse_hunk_starts(line: &str) -> Option<(usize, usize)> {
+    let line = line.trim();
+    if !line.starts_with("@@") {
+        return None;
+    }
+    let parts: Vec<&str> = line.split("@@").collect();
+    let body = parts.get(1)?.trim();
+    let mut ranges = body.split_whitespace();
+    let old_range = ranges.next()?.strip_prefix('-')?;
+    let new_range = ranges.next()?.strip_prefix('+')?;
+    Some((parse_hunk_start(old_range)?, parse_hunk_start(new_range)?))
+}
+
+fn parse_hunk_start(range: &str) -> Option<usize> {
+    let start = range.split(',').next()?;
+    start.parse::<usize>().ok()
 }
 
 fn looks_like_hunk_body_line(line: &str) -> bool {
@@ -1302,6 +1344,43 @@ diff --git a/demo.txt b/demo.txt
     }
 
     #[test]
+    fn rewrites_explicit_hunk_headers_with_wrong_counts() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(dir.path().join("demo.txt"), "alpha\nold\nomega\n")?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "\
+diff --git a/demo.txt b/demo.txt
+--- a/demo.txt
++++ b/demo.txt
+@@ -1,99 +1,99 @@
+ alpha
+-old
++new
+ omega
+"
+                .to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(result.valid, "{}", result.check_stderr);
+        assert!(result.applied, "{}", result.apply_stderr);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("demo.txt"))?,
+            "alpha\nnew\nomega\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn ignores_codex_end_of_file_marker() -> Result<()> {
         let dir = tempdir()?;
         fs::write(dir.path().join("demo.txt"), "old\n")?;
@@ -1577,6 +1656,28 @@ Resources/Views/edit.leaf
         assert!(result.valid, "{}", result.check_stderr);
         assert!(result.applied, "{}", result.apply_stderr);
         assert_eq!(fs::read_to_string(dir.path().join("Package.swift"))?, "let a = 2\n");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_non_patch_payload_with_clear_message() -> Result<()> {
+        let dir = tempdir()?;
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .status()?;
+        assert!(status.success());
+
+        let result = run(
+            dir.path(),
+            ApplyPatchArgs {
+                patch: "Please update the file with the following change.".to_string(),
+                approved: Some(true),
+            },
+        )?;
+
+        assert!(!result.valid);
+        assert!(result.check_stderr.contains("expected a patch body"));
         Ok(())
     }
 }

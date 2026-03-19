@@ -11,6 +11,7 @@ use crate::tools::run_shell_command::{RunShellCommandArgs, run as run_shell_comm
 use crate::tools::run_tests::{RunTestsArgs, run_tool as run_tests};
 use crate::tools::search_text::{SearchTextArgs, run as run_search_text};
 use crate::tools::undo_last_patch::{UndoLastPatchArgs, run as run_undo_last_patch};
+use crate::tools::write_file::{WriteFileArgs, run as run_write_file};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -96,6 +97,11 @@ impl ToolRegistry {
                 let args: UndoLastPatchArgs = serde_json::from_value(call.arguments)
                     .context("invalid undo_last_patch arguments")?;
                 serde_json::to_value(run_undo_last_patch(&self.repo_root, args)?)?
+            }
+            "write_file" => {
+                let args: WriteFileArgs = serde_json::from_value(call.arguments)
+                    .context("invalid write_file arguments")?;
+                serde_json::to_value(run_write_file(&self.repo_root, args)?)?
             }
             "git_status" => serde_json::to_value(run_git_status(&self.repo_root)?)?,
             "git_diff" => {
@@ -201,6 +207,20 @@ impl ToolRegistry {
                 "approved": { "type": "boolean" }
               },
               "required": ["patch"]
+            }
+          },
+          {
+            "type": "function",
+            "name": "write_file",
+            "description": "Write full file contents to a repository path. Prefer apply_patch for small code edits, but use write_file after re-reading the current file when updating structured markdown task/status files or when patch context keeps failing.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": { "type": "string" },
+                "content": { "type": "string" },
+                "approved": { "type": "boolean" }
+              },
+              "required": ["path", "content"]
             }
           }
           ,

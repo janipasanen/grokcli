@@ -927,6 +927,11 @@ fn describe_tool_call(tool_name: &str, args: &Value) -> String {
             wrapper_command("run_formatter", args),
         ),
         "apply_patch" => describe_apply_patch(args),
+        "write_file" => {
+            let path = string_arg(args, "path").unwrap_or("?");
+            let bytes = string_arg(args, "content").map(|s| s.len()).unwrap_or(0);
+            format!("write_file path={path:?} bytes={bytes}")
+        }
         "git_status" => "git_status".to_string(),
         "git_diff" => {
             let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
@@ -1138,6 +1143,7 @@ fn render_tool_result_preview(tool_name: &str, result: &Value) -> Option<String>
         "read_file" => render_read_file_result(result),
         "list_directory" => render_list_directory_result(result),
         "apply_patch" => Some(render_apply_patch_result(result)),
+        "write_file" => Some(render_write_file_result(result)),
         "checkpoint_repo" => Some(render_checkpoint_result(result)),
         "undo_last_patch" => Some(render_undo_result(result)),
         _ if is_command_like_result(result) => Some(render_command_like_result(tool_name, result)),
@@ -1313,6 +1319,30 @@ fn render_apply_patch_result(result: &Value) -> String {
         out.push_str(&truncate_preview_text(apply_stderr));
     }
     out
+}
+
+fn render_write_file_result(result: &Value) -> String {
+    let path = result.get("path").and_then(Value::as_str).unwrap_or("?");
+    let written = result
+        .get("written")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let approval_required = result
+        .get("approval_required")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let bytes_written = result
+        .get("bytes_written")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let status = if approval_required {
+        "approval-required"
+    } else if written {
+        "written"
+    } else {
+        "failed"
+    };
+    format!("write_file {status} path={path:?} bytes={bytes_written}")
 }
 
 fn render_checkpoint_result(result: &Value) -> String {

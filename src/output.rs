@@ -1,6 +1,6 @@
 use rustyline::ExternalPrinter;
 use std::io::{self, Write};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 pub trait OutputSink: Send + Sync {
     fn stdout(&self, text: &str);
@@ -21,20 +21,37 @@ pub trait OutputSink: Send + Sync {
 #[derive(Default)]
 pub struct StdOutputSink;
 
+fn terminal_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 impl OutputSink for StdOutputSink {
     fn stdout(&self, text: &str) {
+        let _guard = match terminal_write_lock().lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
         let mut out = io::stdout();
         let _ = out.write_all(text.as_bytes());
         let _ = out.flush();
     }
 
     fn stderr(&self, text: &str) {
+        let _guard = match terminal_write_lock().lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
         let mut err = io::stderr();
         let _ = err.write_all(text.as_bytes());
         let _ = err.flush();
     }
 
     fn flush(&self) {
+        let _guard = match terminal_write_lock().lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
         let _ = io::stdout().flush();
         let _ = io::stderr().flush();
     }
